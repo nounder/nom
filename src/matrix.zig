@@ -1,7 +1,4 @@
-//! Matrix allocation and data structures for the optimal matching algorithm.
-//!
 //! The matrix is used for the Smith-Waterman dynamic programming algorithm.
-//! Memory is preallocated to avoid allocations during matching.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -10,28 +7,22 @@ const CharClass = @import("chars.zig").CharClass;
 const Char = @import("chars.zig").Char;
 const score = @import("score.zig");
 
-/// Maximum matrix size in bytes (100KB)
 pub const MAX_MATRIX_SIZE: usize = 100 * 1024;
 
-/// Maximum haystack length for optimal matching
 pub const MAX_HAYSTACK_LEN: usize = 2048;
 
-/// Maximum needle length for optimal matching
 pub const MAX_NEEDLE_LEN: usize = 2048;
 
-/// Score cell in the DP matrix
 pub const ScoreCell = struct {
-    /// Current best score at this position
     score_val: u16 = 0,
-    /// Consecutive bonus for this match run
     consecutive_bonus: u8 = 0,
-    /// Whether this cell represents a match (vs skip)
     matched: bool = false,
 
     pub const UNMATCHED: ScoreCell = .{
         .score_val = 0,
         .consecutive_bonus = 0,
-        .matched = true, // Special marker - consecutive_bonus=0 with matched=true can't occur naturally
+        // consecutive_bonus=0 with matched=true can't occur naturally
+        .matched = true,
     };
 
     pub fn eql(self: ScoreCell, other: ScoreCell) bool {
@@ -41,7 +32,6 @@ pub const ScoreCell = struct {
     }
 };
 
-/// Matrix cell storing path information for reconstruction
 pub const MatrixCell = packed struct {
     data: u8 = 0,
 
@@ -55,23 +45,17 @@ pub const MatrixCell = packed struct {
     }
 };
 
-/// View into allocated matrix data for a specific match operation
 pub fn MatcherDataView(comptime CharType: type) type {
     return struct {
         const Self = @This();
 
-        /// Copy of haystack (potentially normalized)
         haystack: []CharType,
-        /// Precomputed bonus values for each haystack position
         bonus: []u8,
-        /// Current row of the score matrix
         current_row: []ScoreCell,
-        /// Row offsets (first occurrence of each needle char)
         row_offs: []u16,
-        /// Matrix cells for path reconstruction
         matrix_cells: []MatrixCell,
 
-        /// Setup the matrix for matching, returns false if no match is possible
+        /// returns false if no match is possible
         pub fn setup(
             self: *Self,
             comptime NeedleCharType: type,
@@ -113,6 +97,7 @@ pub fn MatcherDataView(comptime CharType: type) type {
 
             // Score the first row
             self.scoreFirstRow(NeedleCharType, needle, config, start);
+
             return true;
         }
 
@@ -228,7 +213,6 @@ pub fn MatcherDataView(comptime CharType: type) type {
 
                 self.scoreRow(
                     NeedleCharType,
-                    needle_char,
                     next_needle_char,
                     row_off,
                     next_row_off,
@@ -250,7 +234,6 @@ pub fn MatcherDataView(comptime CharType: type) type {
         fn scoreRow(
             self: *Self,
             comptime NeedleCharType: type,
-            _: NeedleCharType, // needle_char - unused
             next_needle_char: NeedleCharType,
             row_off: u16,
             next_row_off: u16,
@@ -431,13 +414,11 @@ fn charEql(comptime H: type, comptime N: type, h: H, n: N) bool {
     return h == n;
 }
 
-/// Preallocated memory slab for matrix operations
 pub const MatrixSlab = struct {
-    // Single large allocation for all matrix data
     memory: []align(8) u8,
     allocator: Allocator,
 
-    const SLAB_SIZE: usize = 256 * 1024; // ~256KB should be enough
+    const SLAB_SIZE: usize = 256 * 1024; // 256kb should be enough
 
     pub fn init(allocator: Allocator) !MatrixSlab {
         const memory = try allocator.alignedAlloc(u8, .@"8", SLAB_SIZE);
