@@ -15,7 +15,8 @@ pub fn build(b: *std.Build) void {
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize_option = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default: ReleaseFast)");
+    const optimize = optimize_option orelse .ReleaseFast;
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -141,6 +142,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Install step to copy the binary to ~/bin
+    const home_install_step = b.step("home", "Install nom to ~/bin");
+    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const dest_path = b.fmt("{s}/bin/nom", .{home});
+    const copy_step = b.addSystemCommand(&.{ "cp", "-f" });
+    copy_step.addArtifactArg(exe);
+    copy_step.addArg(dest_path);
+    home_install_step.dependOn(&copy_step.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
