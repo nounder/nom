@@ -26,9 +26,11 @@ pub fn main() !void {
         return;
     }
 
-    // Read all input
-    const stdin = std.fs.File.stdin();
-    const input = try stdin.readToEndAlloc(allocator, 1024 * 1024 * 100); // 100MB max
+    // Get input: use FZF_DEFAULT_COMMAND or walker if stdin is TTY
+    const input = if (fzf.isStdinTty())
+        try fzf.getDefaultSource(allocator)
+    else
+        try std.fs.File.stdin().readToEndAlloc(allocator, 100 * 1024 * 1024);
     defer allocator.free(input);
 
     if (args.filter != null) {

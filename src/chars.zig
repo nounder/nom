@@ -167,7 +167,6 @@ fn unicodeCharClass(c: u21) CharClass {
     return .non_word;
 }
 
-
 /// Iterator over graphemes in a string
 /// For simplicity, this iterates over codepoints (full grapheme clustering would need more tables)
 pub fn graphemes(text: []const u8) GraphemeIterator {

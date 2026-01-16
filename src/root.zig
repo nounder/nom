@@ -53,6 +53,9 @@ pub const Terminal = @import("term.zig").Terminal;
 // fzf compatibility
 pub const fzf = @import("fzf.zig");
 
+// File utilities
+pub const files = @import("files.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const nom = @import("root.zig");
+const files = @import("files.zig");
 
 const CaseMatching = nom.CaseMatching;
 const Normalization = nom.Normalization;
@@ -655,6 +656,49 @@ pub fn runTui(
     }
 
     return false;
+}
+
+/// Check if stdin is connected to a TTY
+pub fn isStdinTty() bool {
+    return std.posix.isatty(std.posix.STDIN_FILENO);
+}
+
+/// Get default source when stdin is a TTY.
+/// Checks FZF_DEFAULT_COMMAND env var, falls back to built-in walker.
+pub fn getDefaultSource(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.posix.getenv("FZF_DEFAULT_COMMAND")) |cmd| {
+        return try runShellCommand(allocator, cmd);
+    }
+    return try files.walk(allocator);
+}
+
+/// Run a shell command and return its stdout
+fn runShellCommand(allocator: std.mem.Allocator, cmd: [*:0]const u8) ![]const u8 {
+    const cmd_slice = std.mem.span(cmd);
+    var child = std.process.Child.init(&.{ "sh", "-c", cmd_slice }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    const stdout = child.stdout orelse return error.NoStdout;
+    const result = try stdout.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    errdefer allocator.free(result);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                allocator.free(result);
+                return error.CommandFailed;
+            }
+        },
+        else => {
+            allocator.free(result);
+            return error.CommandFailed;
+        },
+    }
+
+    return result;
 }
 
 test "Args.parse basic flags" {
