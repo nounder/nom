@@ -152,6 +152,27 @@ pub fn build(b: *std.Build) void {
     copy_step.addArg(dest_path);
     home_install_step.dependOn(&copy_step.step);
 
+    // ============================================================
+    // Benchmarks
+    // ============================================================
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "nom", .module = mod },
+            },
+        }),
+    });
+
+    b.installArtifact(bench_exe);
+
+    const bench_step = b.step("bench", "Run benchmarks");
+    const bench_cmd = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&bench_cmd.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

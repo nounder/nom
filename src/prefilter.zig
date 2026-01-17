@@ -91,33 +91,108 @@ fn prefilterAsciiExact(
     return .{ .start = start, .greedy_end = greedy_end, .end = end };
 }
 
-/// Find ASCII character, ignoring case for lowercase letters
+/// Find ASCII character, ignoring case for lowercase letters.
+/// Uses SIMD to search for both lowercase and uppercase variants simultaneously.
 fn findAsciiIgnoreCase(c: u8, haystack: []const u8) ?usize {
     if (c >= 'a' and c <= 'z') {
-        // Search for both lowercase and uppercase
         const upper = c - 32;
-        for (haystack, 0..) |h, i| {
-            if (h == c or h == upper) return i;
-        }
-        return null;
+        return findAsciiIgnoreCaseSimd(c, upper, haystack);
     } else {
         return std.mem.indexOfScalar(u8, haystack, c);
     }
 }
 
-/// Find ASCII character from end, ignoring case
+/// SIMD implementation for case-insensitive character search.
+/// Searches for both lowercase `c` and uppercase `upper` simultaneously.
+fn findAsciiIgnoreCaseSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
+    const Vec = @Vector(16, u8);
+
+    const lower_vec: Vec = @splat(c);
+    const upper_vec: Vec = @splat(upper);
+
+    var i: usize = 0;
+
+    // Process 16 bytes at a time with SIMD
+    while (i + 16 <= haystack.len) {
+        const chunk: Vec = haystack[i..][0..16].*;
+
+        // Check for matches against both lowercase and uppercase
+        const lower_match = chunk == lower_vec;
+        const upper_match = chunk == upper_vec;
+
+        // Combine matches: true if either lowercase or uppercase matches
+        const any_match = @select(bool, lower_match, lower_match, upper_match);
+
+        // Convert bool vector to bitmask and find first set bit
+        const mask: u16 = @bitCast(any_match);
+        if (mask != 0) {
+            return i + @ctz(mask);
+        }
+
+        i += 16;
+    }
+
+    // Handle remaining bytes with scalar code
+    for (haystack[i..], i..) |h, j| {
+        if (h == c or h == upper) return j;
+    }
+
+    return null;
+}
+
+/// Find ASCII character from end, ignoring case.
+/// Uses SIMD to search for both lowercase and uppercase variants simultaneously.
+/// Returns index + 1 (position after the found character) or null if not found.
 fn findAsciiIgnoreCaseRev(c: u8, haystack: []const u8) ?usize {
     if (c >= 'a' and c <= 'z') {
         const upper = c - 32;
-        var i = haystack.len;
-        while (i > 0) {
-            i -= 1;
-            if (haystack[i] == c or haystack[i] == upper) return i + 1;
-        }
-        return null;
+        return findAsciiIgnoreCaseRevSimd(c, upper, haystack);
     } else {
         return if (std.mem.lastIndexOfScalar(u8, haystack, c)) |idx| idx + 1 else null;
     }
+}
+
+/// SIMD implementation for reverse case-insensitive character search.
+/// Searches from the end for both lowercase `c` and uppercase `upper`.
+/// Returns index + 1 (position after the found character) or null if not found.
+fn findAsciiIgnoreCaseRevSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
+    const Vec = @Vector(16, u8);
+
+    const lower_vec: Vec = @splat(c);
+    const upper_vec: Vec = @splat(upper);
+
+    var i: usize = haystack.len;
+
+    // Process 16 bytes at a time from the end with SIMD
+    while (i >= 16) {
+        const start = i - 16;
+        const chunk: Vec = haystack[start..][0..16].*;
+
+        // Check for matches against both lowercase and uppercase
+        const lower_match = chunk == lower_vec;
+        const upper_match = chunk == upper_vec;
+
+        // Combine matches: true if either lowercase or uppercase matches
+        const any_match = @select(bool, lower_match, lower_match, upper_match);
+
+        // Convert bool vector to bitmask
+        const mask: u16 = @bitCast(any_match);
+        if (mask != 0) {
+            // Find the highest set bit (last match in this chunk)
+            const highest_bit = 15 - @clz(mask);
+            return start + highest_bit + 1;
+        }
+
+        i -= 16;
+    }
+
+    // Handle remaining bytes at the beginning with scalar code
+    while (i > 0) {
+        i -= 1;
+        if (haystack[i] == c or haystack[i] == upper) return i + 1;
+    }
+
+    return null;
 }
 
 /// Prefilter result for non-ASCII
@@ -205,4 +280,40 @@ test "prefilter ascii greedy only" {
     const result = prefilterAscii(&config, "hello world", "hlo", true);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(result.?.greedy_end, result.?.end);
+}
+
+test "findAsciiIgnoreCase SIMD" {
+    // Test forward search
+    try std.testing.expectEqual(@as(?usize, 0), findAsciiIgnoreCase('h', "hello"));
+    try std.testing.expectEqual(@as(?usize, 0), findAsciiIgnoreCase('h', "Hello"));
+    try std.testing.expectEqual(@as(?usize, 4), findAsciiIgnoreCase('o', "hello"));
+    try std.testing.expectEqual(@as(?usize, 4), findAsciiIgnoreCase('o', "hellO"));
+    try std.testing.expectEqual(@as(?usize, null), findAsciiIgnoreCase('x', "hello"));
+
+    // Test with longer strings (exercises SIMD path)
+    const long_str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX";
+    try std.testing.expectEqual(@as(?usize, 32), findAsciiIgnoreCase('x', long_str));
+
+    const long_upper = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAХ"; // note: last char is Cyrillic
+    try std.testing.expectEqual(@as(?usize, 0), findAsciiIgnoreCase('a', long_upper));
+}
+
+test "findAsciiIgnoreCaseRev SIMD" {
+    // Test reverse search - returns index + 1
+    try std.testing.expectEqual(@as(?usize, 1), findAsciiIgnoreCaseRev('h', "hello"));
+    try std.testing.expectEqual(@as(?usize, 1), findAsciiIgnoreCaseRev('h', "Hello"));
+    try std.testing.expectEqual(@as(?usize, 5), findAsciiIgnoreCaseRev('o', "hello"));
+    try std.testing.expectEqual(@as(?usize, 5), findAsciiIgnoreCaseRev('o', "hellO"));
+    try std.testing.expectEqual(@as(?usize, null), findAsciiIgnoreCaseRev('x', "hello"));
+
+    // Test finding last occurrence - "hello all" has 'l' at indices 2,3,8, returns 8+1=9
+    try std.testing.expectEqual(@as(?usize, 9), findAsciiIgnoreCaseRev('l', "hello all"));
+
+    // Test with longer strings (exercises SIMD path)
+    const long_str = "Xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expectEqual(@as(?usize, 1), findAsciiIgnoreCaseRev('x', long_str));
+
+    // Multiple matches - should find the last one
+    const multi = "aXaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX";
+    try std.testing.expectEqual(@as(?usize, 34), findAsciiIgnoreCaseRev('x', multi));
 }
