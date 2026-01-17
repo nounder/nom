@@ -4,6 +4,7 @@
 //! match regions before running the more expensive DP algorithm.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
 const Char = @import("chars.zig").Char;
 const Utf32Str = @import("utf32_str.zig").Utf32Str;
@@ -94,19 +95,18 @@ fn prefilterAsciiExact(
 /// Find ASCII character, ignoring case for lowercase letters.
 /// Uses SIMD to search for both lowercase and uppercase variants simultaneously.
 fn findAsciiIgnoreCase(c: u8, haystack: []const u8) ?usize {
-    if (c >= 'a' and c <= 'z') {
-        const upper = c - 32;
-        return findAsciiIgnoreCaseSimd(c, upper, haystack);
-    } else {
+    // Non-lowercase: use standard library (no case variant to check)
+    if (c < 'a' or c > 'z') {
         return std.mem.indexOfScalar(u8, haystack, c);
     }
-}
 
-/// SIMD implementation for case-insensitive character search.
-/// Searches for both lowercase `c` and uppercase `upper` simultaneously.
-/// Uses 8-byte vectors for short strings, 16-byte vectors for longer ones.
-fn findAsciiIgnoreCaseSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
-    // Fast path: use 8-byte SIMD for short strings
+    const upper = c - 32;
+
+    // ARM64 has native 64-bit NEON registers (D registers), so 8-byte SIMD is efficient.
+    // x86-64 only has 128-bit XMM registers, so 8-byte vectors waste half the register.
+    const use_simd8 = builtin.cpu.arch == .aarch64;
+
+    // Fast path: use 8-byte SIMD for exactly 8 bytes, scalar for <8
     if (haystack.len <= 8) {
         if (haystack.len == 8) {
             const Vec8 = @Vector(8, u8);
@@ -124,37 +124,46 @@ fn findAsciiIgnoreCaseSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
         return null;
     }
 
+    // ARM64 optimization: use SIMD 8 for 9-15 byte strings.
+    // SIMD 16 can't process these (needs 16+ bytes), so without this they fall back to scalar.
+    // On x86-64, 8-byte vectors still use 128-bit XMM registers (no narrower option),
+    // so there's no benefit over scalar - just extra branch overhead.
+    if (use_simd8 and haystack.len < 16) {
+        const Vec8 = @Vector(8, u8);
+        const chunk: Vec8 = haystack[0..8].*;
+        const lower_match = chunk == @as(Vec8, @splat(c));
+        const upper_match = chunk == @as(Vec8, @splat(upper));
+        const any_match = @select(bool, lower_match, lower_match, upper_match);
+        const mask: u8 = @bitCast(any_match);
+        if (mask != 0) return @ctz(mask);
+
+        // Scalar for remaining 1-7 bytes
+        for (haystack[8..], 8..) |h, j| {
+            if (h == c or h == upper) return j;
+        }
+        return null;
+    }
+
+    // SIMD 16 for >=16 byte strings
     const Vec = @Vector(16, u8);
     const lower_vec: Vec = @splat(c);
     const upper_vec: Vec = @splat(upper);
 
     var i: usize = 0;
-
-    // Process 16 bytes at a time with SIMD
     while (i + 16 <= haystack.len) {
         const chunk: Vec = haystack[i..][0..16].*;
-
-        // Check for matches against both lowercase and uppercase
         const lower_match = chunk == lower_vec;
         const upper_match = chunk == upper_vec;
-
-        // Combine matches: true if either lowercase or uppercase matches
         const any_match = @select(bool, lower_match, lower_match, upper_match);
-
-        // Convert bool vector to bitmask and find first set bit
         const mask: u16 = @bitCast(any_match);
-        if (mask != 0) {
-            return i + @ctz(mask);
-        }
-
+        if (mask != 0) return i + @ctz(mask);
         i += 16;
     }
 
-    // Handle remaining bytes with scalar code
+    // Scalar for remaining bytes
     for (haystack[i..], i..) |h, j| {
         if (h == c or h == upper) return j;
     }
-
     return null;
 }
 
@@ -162,20 +171,18 @@ fn findAsciiIgnoreCaseSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
 /// Uses SIMD to search for both lowercase and uppercase variants simultaneously.
 /// Returns index + 1 (position after the found character) or null if not found.
 fn findAsciiIgnoreCaseRev(c: u8, haystack: []const u8) ?usize {
-    if (c >= 'a' and c <= 'z') {
-        const upper = c - 32;
-        return findAsciiIgnoreCaseRevSimd(c, upper, haystack);
-    } else {
+    // Non-lowercase: use standard library (no case variant to check)
+    if (c < 'a' or c > 'z') {
         return if (std.mem.lastIndexOfScalar(u8, haystack, c)) |idx| idx + 1 else null;
     }
-}
 
-/// SIMD implementation for reverse case-insensitive character search.
-/// Searches from the end for both lowercase `c` and uppercase `upper`.
-/// Uses 8-byte vectors for short strings, 16-byte vectors for longer ones.
-/// Returns index + 1 (position after the found character) or null if not found.
-fn findAsciiIgnoreCaseRevSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
-    // Fast path: use 8-byte SIMD for short strings
+    const upper = c - 32;
+
+    // ARM64 has native 64-bit NEON registers (D registers), so 8-byte SIMD is efficient.
+    // x86-64 only has 128-bit XMM registers, so 8-byte vectors waste half the register.
+    const use_simd8 = builtin.cpu.arch == .aarch64;
+
+    // Fast path: use 8-byte SIMD for exactly 8 bytes, scalar for <8
     if (haystack.len <= 8) {
         if (haystack.len == 8) {
             const Vec8 = @Vector(8, u8);
@@ -198,41 +205,58 @@ fn findAsciiIgnoreCaseRevSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
         return null;
     }
 
+    // ARM64 optimization: use SIMD 8 for 9-15 byte strings.
+    // SIMD 16 can't process these (needs 16+ bytes), so without this they fall back to scalar.
+    // On x86-64, 8-byte vectors still use 128-bit XMM registers (no narrower option),
+    // so there's no benefit over scalar - just extra branch overhead.
+    if (use_simd8 and haystack.len < 16) {
+        // Check last 8 bytes first (positions len-8 to len-1)
+        const start = haystack.len - 8;
+        const Vec8 = @Vector(8, u8);
+        const chunk: Vec8 = haystack[start..][0..8].*;
+        const lower_match = chunk == @as(Vec8, @splat(c));
+        const upper_match = chunk == @as(Vec8, @splat(upper));
+        const any_match = @select(bool, lower_match, lower_match, upper_match);
+        const mask: u8 = @bitCast(any_match);
+        if (mask != 0) {
+            const highest_bit = 7 - @clz(mask);
+            return start + highest_bit + 1;
+        }
+
+        // Scalar for first 1-7 bytes (positions 0 to start-1)
+        var i = start;
+        while (i > 0) {
+            i -= 1;
+            if (haystack[i] == c or haystack[i] == upper) return i + 1;
+        }
+        return null;
+    }
+
+    // SIMD 16 for >=16 byte strings
     const Vec = @Vector(16, u8);
     const lower_vec: Vec = @splat(c);
     const upper_vec: Vec = @splat(upper);
 
     var i: usize = haystack.len;
-
-    // Process 16 bytes at a time from the end with SIMD
     while (i >= 16) {
         const start = i - 16;
         const chunk: Vec = haystack[start..][0..16].*;
-
-        // Check for matches against both lowercase and uppercase
         const lower_match = chunk == lower_vec;
         const upper_match = chunk == upper_vec;
-
-        // Combine matches: true if either lowercase or uppercase matches
         const any_match = @select(bool, lower_match, lower_match, upper_match);
-
-        // Convert bool vector to bitmask
         const mask: u16 = @bitCast(any_match);
         if (mask != 0) {
-            // Find the highest set bit (last match in this chunk)
             const highest_bit = 15 - @clz(mask);
             return start + highest_bit + 1;
         }
-
         i -= 16;
     }
 
-    // Handle remaining bytes at the beginning with scalar code
+    // Scalar for remaining bytes at the beginning
     while (i > 0) {
         i -= 1;
         if (haystack[i] == c or haystack[i] == upper) return i + 1;
     }
-
     return null;
 }
 
