@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const Terminal = @import("term.zig").Terminal;
+const posix = std.posix;
 
 /// Key modifiers
 pub const Modifiers = packed struct {
@@ -115,6 +116,28 @@ pub const InputReader = struct {
 
         // Regular character (possibly UTF-8)
         return self.parseChar(term, byte);
+    }
+
+    /// Read an event, returning `.none` when no data arrives before the timeout.
+    pub fn readEventWithTimeout(self: *InputReader, term: *Terminal, timeout_ns: u64) Event {
+        if (self.buf_pos < self.buf_len) {
+            return self.readEvent(term);
+        }
+
+        // Use poll() so the event loop can wake periodically without a keypress.
+        var fds = [_]posix.pollfd{
+            .{ .fd = term.ttyin.handle, .events = posix.POLL.IN, .revents = 0 },
+        };
+
+        const timeout_ms_u64 = timeout_ns / std.time.ns_per_ms;
+        const timeout_ms: i32 = @intCast(@min(timeout_ms_u64, @as(u64, std.math.maxInt(i32))));
+
+        const rc = posix.poll(&fds, timeout_ms) catch return .none;
+        if (rc == 0) {
+            return .none;
+        }
+
+        return self.readEvent(term);
     }
 
     fn nextByte(self: *InputReader, term: *Terminal) ?u8 {

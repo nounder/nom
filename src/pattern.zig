@@ -317,20 +317,21 @@ pub const Atom = struct {
             return result;
         }
 
-        var matches = std.ArrayList(struct { item: T, score_val: u16 }).init(allocator);
-        var buf = std.ArrayList(u21).init(allocator);
-        defer buf.deinit();
+        var matches = std.ArrayList(struct { item: T, score_val: u16 }){};
+        defer matches.deinit(allocator);
+        var buf = std.ArrayList(u21){};
+        defer buf.deinit(allocator);
 
         for (items) |item| {
             const str = getString(item);
-            const haystack = Utf32Str.init(str, &buf);
+            const haystack = Utf32Str.init(str, allocator, &buf);
             if (self.score(haystack, matcher)) |s| {
-                try matches.append(.{ .item = item, .score_val = s });
+                try matches.append(allocator, .{ .item = item, .score_val = s });
             }
         }
 
         // Sort by score descending
-        const result = try matches.toOwnedSlice();
+        const result = try matches.toOwnedSlice(allocator);
         std.mem.sort(@TypeOf(result[0]), result, {}, struct {
             fn lessThan(_: void, a: anytype, b: anytype) bool {
                 return a.score_val > b.score_val;

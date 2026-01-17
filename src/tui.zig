@@ -16,6 +16,10 @@ const input = @import("input.zig");
 const Event = input.Event;
 const Key = input.Key;
 const InputReader = input.InputReader;
+const chunk = @import("chunklist.zig");
+const StreamingReader = @import("streaming_reader.zig").StreamingReader;
+const ParsedNth = @import("streaming_reader.zig").ParsedNth;
+const TopKHeap = @import("topk.zig").TopKHeap;
 
 const nom = @import("root.zig");
 const Matcher = nom.Matcher;
@@ -45,6 +49,9 @@ pub const TuiConfig = struct {
     ansi: bool = true,
     case_matching: CaseMatching = .smart,
     exact: bool = false,
+    delimiter: u8 = '\n',
+    nth: ?[]const u8 = null,
+    with_nth: ?[]const u8 = null,
     preview: ?[]const u8 = null,
     preview_window: PreviewWindow = .{},
     fullscreen: bool = false, // Use alternate screen buffer
@@ -108,11 +115,56 @@ pub const TuiResult = struct {
 
 /// Item with match data
 const Item = struct {
-    text: []const u8,
+    item: *const chunk.ChunkItem,
     score: u32,
-    indices: []u32,
+    indices: []const u32,
     selected: bool = false,
 };
+
+const SearchResult = struct {
+    item: *const chunk.ChunkItem,
+    score: u32,
+    indices: []const u32,
+    selected: bool = false,
+};
+
+const MAX_RESULTS: usize = 2000;
+
+fn buildChunkFromLines(
+    allocator: Allocator,
+    lines: []const []const u8,
+    start_id: usize,
+    nth: *ParsedNth,
+    with_nth: *ParsedNth,
+) !struct { chunk: chunk.Chunk, next_id: usize } {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+
+    var items = try allocator.alloc(chunk.ChunkItem, lines.len);
+    var next = start_id;
+
+    for (lines, 0..) |line, i| {
+        const match_text = try nth.apply(arena.allocator(), line);
+        const display_text = try with_nth.apply(arena.allocator(), line);
+
+        items[i] = .{
+            .id = next,
+            .display = display_text,
+            .match_text = match_text,
+            .original = line,
+        };
+        next += 1;
+    }
+
+    return .{
+        .chunk = .{
+            .items = items,
+            .data = &.{}, // Owned by caller (input buffer), not freed here
+            .arena = arena,
+        },
+        .next_id = next,
+    };
+}
 
 /// The interactive TUI
 pub const Tui = struct {
@@ -122,8 +174,12 @@ pub const Tui = struct {
     config: TuiConfig,
 
     // Input data
-    items: []const []const u8,
-    header_items: []const []const u8,
+    chunk_list: chunk.ChunkList,
+    items: std.ArrayList(*const chunk.ChunkItem),
+    header_items: std.ArrayList(*const chunk.ChunkItem),
+    stream_reader: ?*StreamingReader,
+    loading: bool,
+    total_loaded: usize,
 
     // Matcher
     matcher: Matcher,
@@ -161,6 +217,7 @@ pub const Tui = struct {
         allocator: Allocator,
         items: []const []const u8,
         config: TuiConfig,
+        stream_reader: ?*StreamingReader,
     ) !Tui {
         var term = try Terminal.init();
         errdefer term.deinit();
@@ -175,12 +232,32 @@ pub const Tui = struct {
             matcher.config.ignore_case = false;
         }
 
-        // Split header items if configured
-        var header_items: []const []const u8 = &.{};
-        var data_items = items;
-        if (config.header_lines > 0 and items.len > config.header_lines) {
-            header_items = items[0..config.header_lines];
-            data_items = items[config.header_lines..];
+        var chunk_list = chunk.ChunkList.init(allocator);
+        errdefer chunk_list.deinit();
+
+        var item_list = std.ArrayList(*const chunk.ChunkItem){};
+        errdefer item_list.deinit(allocator);
+
+        var header_list = std.ArrayList(*const chunk.ChunkItem){};
+        errdefer header_list.deinit(allocator);
+
+        // Build initial chunk for static items
+        if (items.len > 0) {
+            var nth_parser = try ParsedNth.init(allocator, config.nth);
+            defer nth_parser.deinit();
+            var with_nth_parser = try ParsedNth.init(allocator, config.with_nth);
+            defer with_nth_parser.deinit();
+
+            const built = try buildChunkFromLines(allocator, items, 0, &nth_parser, &with_nth_parser);
+            try chunk_list.appendChunk(built.chunk);
+
+            for (built.chunk.items) |*it| {
+                if (it.id < config.header_lines) {
+                    try header_list.append(allocator, it);
+                } else {
+                    try item_list.append(allocator, it);
+                }
+            }
         }
 
         return Tui{
@@ -188,8 +265,12 @@ pub const Tui = struct {
             .term = term,
             .reader = .{},
             .config = config,
-            .items = data_items,
-            .header_items = header_items,
+            .chunk_list = chunk_list,
+            .items = item_list,
+            .header_items = header_list,
+            .stream_reader = stream_reader,
+            .loading = stream_reader != null,
+            .total_loaded = chunk_list.total_count,
             .matcher = matcher,
             .query = .empty,
             .cursor_pos = 0,
@@ -218,12 +299,17 @@ pub const Tui = struct {
 
         // Free resources
         for (self.matched_items.items) |item| {
-            self.allocator.free(item.indices);
+            if (item.indices.len > 0) {
+                self.allocator.free(@constCast(item.indices));
+            }
         }
         self.matched_items.deinit(self.allocator);
         self.indices_buf.deinit(self.allocator);
         self.query.deinit(self.allocator);
         self.selections.deinit();
+        self.items.deinit(self.allocator);
+        self.header_items.deinit(self.allocator);
+        self.chunk_list.deinit();
         self.matcher.deinit();
     }
 
@@ -276,11 +362,16 @@ pub const Tui = struct {
             try self.term.enableMouse();
         }
 
-        // Initial search
-        try self.performSearch();
+        // Start in "loading" mode when streaming; initial draw happens before any search.
+        self.loading = if (self.stream_reader) |r| !r.isDone() else false;
+        self.total_loaded = self.chunk_list.total_count;
+        self.needs_redraw = true;
+        try self.draw();
 
         // Main loop
         while (true) {
+            try self.pollStream();
+
             if (self.needs_search) {
                 try self.performSearch();
                 self.needs_search = false;
@@ -292,7 +383,7 @@ pub const Tui = struct {
                 self.needs_redraw = false;
             }
 
-            const event = self.reader.readEvent(&self.term);
+            const event = self.reader.readEventWithTimeout(&self.term, 10 * std.time.ns_per_ms);
             const action = try self.handleEvent(event);
 
             switch (action) {
@@ -316,6 +407,40 @@ pub const Tui = struct {
                 },
             }
         }
+    }
+
+    fn pollStream(self: *Tui) !void {
+        const reader = self.stream_reader orelse return;
+
+        const prev_loading = self.loading;
+
+        while (reader.pollChunk()) |c| {
+            try self.addChunk(c);
+        }
+
+        self.loading = !reader.isDone();
+        self.total_loaded = self.chunk_list.total_count;
+        if (self.loading != prev_loading) {
+            self.needs_redraw = true;
+        }
+        try reader.checkError();
+    }
+
+    fn addChunk(self: *Tui, c: chunk.Chunk) !void {
+        try self.chunk_list.appendChunk(c);
+
+        for (c.items) |*it| {
+            if (it.id < self.config.header_lines) {
+                try self.header_items.append(self.allocator, it);
+            } else {
+                try self.items.append(self.allocator, it);
+            }
+        }
+
+        // New data means selection/search state is stale; trigger refresh.
+        self.total_loaded = self.chunk_list.total_count;
+        self.needs_search = true;
+        self.needs_redraw = true;
     }
 
     const Action = enum {
@@ -581,25 +706,17 @@ pub const Tui = struct {
     fn toggleSelection(self: *Tui) void {
         if (self.matched_items.items.len == 0) return;
 
-        // Find original index
         const item = &self.matched_items.items[self.selected_idx];
-        const original_idx = self.findOriginalIndex(item.text);
+        const item_id = item.item.id;
 
-        if (self.selections.contains(original_idx)) {
-            _ = self.selections.remove(original_idx);
+        if (self.selections.contains(item_id)) {
+            _ = self.selections.remove(item_id);
             item.selected = false;
         } else {
-            self.selections.put(original_idx, {}) catch {};
+            self.selections.put(item_id, {}) catch {};
             item.selected = true;
         }
         self.needs_redraw = true;
-    }
-
-    fn findOriginalIndex(self: *Tui, text: []const u8) usize {
-        for (self.items, 0..) |item, i| {
-            if (std.mem.eql(u8, item, text)) return i;
-        }
-        return 0;
     }
 
     fn ensureVisible(self: *Tui) void {
@@ -630,7 +747,9 @@ pub const Tui = struct {
     fn performSearch(self: *Tui) !void {
         // Free old indices
         for (self.matched_items.items) |item| {
-            self.allocator.free(item.indices);
+            if (item.indices.len > 0) {
+                self.allocator.free(@constCast(item.indices));
+            }
         }
         self.matched_items.clearRetainingCapacity();
 
@@ -646,36 +765,96 @@ pub const Tui = struct {
         var buf: std.ArrayListUnmanaged(u21) = .empty;
         defer buf.deinit(self.allocator);
 
-        for (self.items) |item_text| {
-            const haystack = Utf32Str.init(item_text, self.allocator, &buf);
+        if (self.query.items.len == 0) {
+            try self.showAllItems();
+            return;
+        }
+
+        var heap = TopKHeap(SearchResult, MAX_RESULTS).init(self.allocator);
+        defer heap.deinit();
+
+        for (self.items.items) |item_ptr| {
+            const haystack = Utf32Str.init(item_ptr.match_text, self.allocator, &buf);
 
             self.indices_buf.clearRetainingCapacity();
             if (pattern.scoreWithIndices(haystack, &self.matcher, &self.indices_buf)) |score| {
-                const indices_copy = try self.allocator.dupe(u32, self.indices_buf.items);
+                const accept = heap.items.items.len < MAX_RESULTS or
+                    (heap.items.items.len > 0 and score > heap.items.items[0].score);
+                if (!accept) continue;
 
-                // Check if this item was previously selected
-                const original_idx = self.findOriginalIndex(item_text);
-                const is_selected = self.selections.contains(original_idx);
+                const alloc_indices = self.indices_buf.items.len > 0;
+                const indices_copy = if (alloc_indices)
+                    try self.allocator.dupe(u32, self.indices_buf.items)
+                else
+                    &[_]u32{};
+                errdefer if (alloc_indices) self.allocator.free(@constCast(indices_copy));
+                const is_selected = self.selections.contains(item_ptr.id);
 
-                try self.matched_items.append(self.allocator, .{
-                    .text = item_text,
+                const replaced = try heap.push(.{
+                    .item = item_ptr,
                     .score = score,
                     .indices = indices_copy,
                     .selected = is_selected,
                 });
+                if (replaced) |old| {
+                    if (old.indices.len > 0) self.allocator.free(@constCast(old.indices));
+                }
             }
         }
 
-        // Sort by score (highest first)
-        std.mem.sort(Item, self.matched_items.items, {}, struct {
-            fn lessThan(_: void, a: Item, b: Item) bool {
+        var results = std.ArrayList(SearchResult){};
+        defer results.deinit(self.allocator);
+
+        while (heap.pop()) |res| {
+            try results.append(self.allocator, res);
+        }
+
+        std.mem.sort(SearchResult, results.items, {}, struct {
+            fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
                 return a.score > b.score;
             }
         }.lessThan);
 
-        // Reset selection if needed
+        try self.matched_items.ensureTotalCapacity(self.allocator, results.items.len);
+
+        for (results.items) |res| {
+            try self.matched_items.append(self.allocator, .{
+                .item = res.item,
+                .score = res.score,
+                .indices = res.indices,
+                .selected = res.selected,
+            });
+        }
+
         if (self.selected_idx >= self.matched_items.items.len) {
-            self.selected_idx = if (self.matched_items.items.len > 0) self.matched_items.items.len - 1 else 0;
+            self.selected_idx = if (self.matched_items.items.len > 0)
+                self.matched_items.items.len - 1
+            else
+                0;
+        }
+        self.scroll_offset = 0;
+        self.ensureVisible();
+    }
+
+    fn showAllItems(self: *Tui) !void {
+        try self.matched_items.ensureTotalCapacity(self.allocator, self.items.items.len);
+
+        for (self.items.items) |item_ptr| {
+            const is_selected = self.selections.contains(item_ptr.id);
+
+            try self.matched_items.append(self.allocator, .{
+                .item = item_ptr,
+                .score = 0,
+                .indices = &[_]u32{},
+                .selected = is_selected,
+            });
+        }
+
+        if (self.selected_idx >= self.matched_items.items.len) {
+            self.selected_idx = if (self.matched_items.items.len > 0)
+                self.matched_items.items.len - 1
+            else
+                0;
         }
         self.scroll_offset = 0;
         self.ensureVisible();
@@ -685,7 +864,7 @@ pub const Tui = struct {
         self.term.updateSize();
 
         // Calculate layout
-        const header_height: u16 = @truncate(self.header_items.len);
+        const header_height: u16 = @truncate(self.header_items.items.len);
         const prompt_height: u16 = 1;
         const info_height: u16 = 1;
         const reserved = header_height + prompt_height + info_height;
@@ -755,10 +934,18 @@ pub const Tui = struct {
         try self.term.setDim();
 
         var buf: [64]u8 = undefined;
-        const info = std.fmt.bufPrint(&buf, "  {d}/{d}", .{
-            self.matched_items.items.len,
-            self.items.len,
-        }) catch "";
+        const total_items = self.items.items.len;
+        const total_display = if (self.total_loaded > self.config.header_lines)
+            self.total_loaded - self.config.header_lines
+        else
+            total_items;
+        const info = if (self.loading)
+            std.fmt.bufPrint(&buf, "  Loading... {d}", .{self.total_loaded}) catch ""
+        else
+            std.fmt.bufPrint(&buf, "  {d}/{d}", .{
+                self.matched_items.items.len,
+                total_display,
+            }) catch "";
 
         if (self.config.multi and self.selections.count() > 0) {
             var buf2: [32]u8 = undefined;
@@ -787,11 +974,12 @@ pub const Tui = struct {
         }
 
         // Header lines from input
-        for (self.header_items) |line| {
+        for (self.header_items.items) |item_ptr| {
             try self.term.resetStyle();
             try self.term.setDim();
             try self.term.write("  ");
             const max_width = self.term.width -| 2;
+            const line = item_ptr.display;
             const display_text = if (line.len > max_width) line[0..max_width] else line;
             try self.term.write(display_text);
             try self.term.clearLineToEnd();
@@ -866,14 +1054,14 @@ pub const Tui = struct {
 
         // Text with highlighting
         const max_width = self.term.width -| 3;
-        try self.drawHighlightedText(item.text, item.indices, max_width, is_current);
+        try self.drawHighlightedText(item.item.display, item.indices, max_width, is_current);
 
         try self.term.clearLineToEnd();
         try self.term.resetStyle();
         try self.term.write("\r\n");
     }
 
-    fn drawHighlightedText(self: *Tui, text: []const u8, indices: []u32, max_width: u16, is_current: bool) !void {
+    fn drawHighlightedText(self: *Tui, text: []const u8, indices: []const u32, max_width: u16, is_current: bool) !void {
         var col: u16 = 0;
         var idx_pos: usize = 0;
         var byte_pos: usize = 0;
@@ -938,7 +1126,7 @@ pub const Tui = struct {
 
     /// Calculate how many lines the TUI needs
     fn calculateNeededLines(self: *Tui) u16 {
-        const header_height: u16 = @truncate(self.header_items.len);
+        const header_height: u16 = @truncate(self.header_items.items.len);
         const prompt_height: u16 = 1;
         const info_height: u16 = 1;
 
@@ -959,14 +1147,14 @@ pub const Tui = struct {
         if (self.config.multi and self.selections.count() > 0) {
             // Return all selections
             var it = self.selections.keyIterator();
-            while (it.next()) |idx| {
-                if (idx.* < self.items.len) {
-                    try result.selected.append(self.allocator, self.items[idx.*]);
+            while (it.next()) |id_ptr| {
+                if (self.findItemById(id_ptr.*)) |item_ptr| {
+                    try result.selected.append(self.allocator, item_ptr.original);
                 }
             }
         } else if (self.matched_items.items.len > 0) {
             // Return current item
-            try result.selected.append(self.allocator, self.matched_items.items[self.selected_idx].text);
+            try result.selected.append(self.allocator, self.matched_items.items[self.selected_idx].item.original);
         }
 
         return result;
@@ -982,9 +1170,19 @@ pub const Tui = struct {
 
         // Return all matched items
         for (self.matched_items.items) |item| {
-            try result.selected.append(self.allocator, item.text);
+            try result.selected.append(self.allocator, item.item.original);
         }
 
         return result;
+    }
+
+    fn findItemById(self: *Tui, id: usize) ?*const chunk.ChunkItem {
+        const snapshot = self.chunk_list.snapshot();
+        for (snapshot.chunks) |c| {
+            for (c.items) |*it| {
+                if (it.id == id) return it;
+            }
+        }
+        return null;
     }
 };
