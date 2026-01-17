@@ -52,12 +52,12 @@ pub const ChunkSource = union(enum) {
     }
 };
 
-const nom = @import("root.zig");
-const Matcher = nom.Matcher;
-const Pattern = nom.Pattern;
-const Utf32Str = nom.Utf32Str;
-const CaseMatching = nom.CaseMatching;
-const Normalization = nom.Normalization;
+const Matcher = @import("matcher.zig").Matcher;
+const pattern_mod = @import("pattern.zig");
+const Pattern = pattern_mod.Pattern;
+const CaseMatching = pattern_mod.CaseMatching;
+const Normalization = pattern_mod.Normalization;
+const Utf32Str = @import("utf32_str.zig").Utf32Str;
 
 /// Check if a Key is a specific character
 fn isChar(key: Key, ch: u21) bool {
@@ -236,6 +236,7 @@ pub const Tui = struct {
     preview_cmd: ?[]const u8,
     preview_visible: bool,
     preview_width: u16,
+    preview_col: u16,
     preview_runner: ?*PreviewRunner,
     preview_scroll: usize,
     last_preview_item: ?usize, // Track which item we last requested preview for
@@ -326,6 +327,7 @@ pub const Tui = struct {
             .preview_cmd = config.preview,
             .preview_visible = config.preview != null and !config.preview_window.hidden,
             .preview_width = 0,
+            .preview_col = 0,
             .preview_runner = null,
             .preview_scroll = 0,
             .last_preview_item = null,
@@ -737,9 +739,22 @@ pub const Tui = struct {
                                 self.needs_redraw = true;
                             }
                         } else if (m.button == .scroll_up) {
-                            self.moveUp();
+                            // Check if scrolling over preview area
+                            if (self.preview_visible and self.preview_col > 0 and m.col >= self.preview_col) {
+                                if (self.preview_scroll > 0) {
+                                    self.preview_scroll -= 1;
+                                    self.needs_redraw = true;
+                                }
+                            } else {
+                                self.moveUp();
+                            }
                         } else if (m.button == .scroll_down) {
-                            self.moveDown();
+                            // Check if scrolling over preview area
+                            if (self.preview_visible and self.preview_col > 0 and m.col >= self.preview_col) {
+                                self.scrollPreviewDown();
+                            } else {
+                                self.moveDown();
+                            }
                         }
                     },
                     else => {},
@@ -894,6 +909,24 @@ pub const Tui = struct {
             self.ensureVisible();
         }
         self.needs_redraw = true;
+    }
+
+    fn scrollPreviewDown(self: *Tui) void {
+        const runner = self.preview_runner orelse return;
+        const result = runner.poll() orelse return;
+        if (result.error_msg != null) return;
+
+        // Calculate how many lines fit in preview area
+        const preview_height = self.visible_count + 3;
+        const max_scroll = if (result.lines.len > preview_height)
+            result.lines.len - preview_height
+        else
+            0;
+
+        if (self.preview_scroll < max_scroll) {
+            self.preview_scroll += 1;
+            self.needs_redraw = true;
+        }
     }
 
     fn toggleSelection(self: *Tui) void {
@@ -1118,6 +1151,7 @@ pub const Tui = struct {
             }
         }
         self.preview_width = preview_width_actual;
+        self.preview_col = preview_col;
 
         self.visible_count = if (available_height > reserved)
             available_height - reserved
