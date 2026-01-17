@@ -187,7 +187,13 @@ pub const StreamingReader = struct {
             if (lines_buf.items.len >= 1000) {
                 try self.flushChunk(&lines_buf, slab, nth_ranges, with_nth_ranges);
                 slab = try self.allocator.alloc(u8, SLAB_SIZE);
-                leftover = &.{};
+                // Preserve leftover data by copying it to the new slab
+                if (leftover.len > 0) {
+                    @memcpy(slab[0..leftover.len], leftover);
+                    leftover = slab[0..leftover.len];
+                } else {
+                    leftover = &.{};
+                }
             }
         }
 
