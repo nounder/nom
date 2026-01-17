@@ -104,9 +104,27 @@ fn findAsciiIgnoreCase(c: u8, haystack: []const u8) ?usize {
 
 /// SIMD implementation for case-insensitive character search.
 /// Searches for both lowercase `c` and uppercase `upper` simultaneously.
+/// Uses 8-byte vectors for short strings, 16-byte vectors for longer ones.
 fn findAsciiIgnoreCaseSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
-    const Vec = @Vector(16, u8);
+    // Fast path: use 8-byte SIMD for short strings
+    if (haystack.len <= 8) {
+        if (haystack.len == 8) {
+            const Vec8 = @Vector(8, u8);
+            const chunk: Vec8 = haystack[0..8].*;
+            const lower_match = chunk == @as(Vec8, @splat(c));
+            const upper_match = chunk == @as(Vec8, @splat(upper));
+            const any_match = @select(bool, lower_match, lower_match, upper_match);
+            const mask: u8 = @bitCast(any_match);
+            if (mask != 0) return @ctz(mask);
+            return null;
+        }
+        for (haystack, 0..) |h, j| {
+            if (h == c or h == upper) return j;
+        }
+        return null;
+    }
 
+    const Vec = @Vector(16, u8);
     const lower_vec: Vec = @splat(c);
     const upper_vec: Vec = @splat(upper);
 
@@ -154,10 +172,33 @@ fn findAsciiIgnoreCaseRev(c: u8, haystack: []const u8) ?usize {
 
 /// SIMD implementation for reverse case-insensitive character search.
 /// Searches from the end for both lowercase `c` and uppercase `upper`.
+/// Uses 8-byte vectors for short strings, 16-byte vectors for longer ones.
 /// Returns index + 1 (position after the found character) or null if not found.
 fn findAsciiIgnoreCaseRevSimd(c: u8, upper: u8, haystack: []const u8) ?usize {
-    const Vec = @Vector(16, u8);
+    // Fast path: use 8-byte SIMD for short strings
+    if (haystack.len <= 8) {
+        if (haystack.len == 8) {
+            const Vec8 = @Vector(8, u8);
+            const chunk: Vec8 = haystack[0..8].*;
+            const lower_match = chunk == @as(Vec8, @splat(c));
+            const upper_match = chunk == @as(Vec8, @splat(upper));
+            const any_match = @select(bool, lower_match, lower_match, upper_match);
+            const mask: u8 = @bitCast(any_match);
+            if (mask != 0) {
+                const highest_bit = 7 - @clz(mask);
+                return highest_bit + 1;
+            }
+            return null;
+        }
+        var i = haystack.len;
+        while (i > 0) {
+            i -= 1;
+            if (haystack[i] == c or haystack[i] == upper) return i + 1;
+        }
+        return null;
+    }
 
+    const Vec = @Vector(16, u8);
     const lower_vec: Vec = @splat(c);
     const upper_vec: Vec = @splat(upper);
 
