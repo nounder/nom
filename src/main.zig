@@ -15,7 +15,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var parsed = try fzf.Args.parse(allocator);
+    var parsed = fzf.Args.parse(allocator) catch |err| switch (err) {
+        error.UnknownOption => std.process.exit(2),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     defer parsed.deinit();
     const args = parsed.args;
 

@@ -126,6 +126,12 @@ pub const Args = struct {
         .with_nth = .{ .long = "--with-nth", .takes_value = true },
     };
 
+    /// Parse error types
+    pub const ParseError = error{
+        UnknownOption,
+        OutOfMemory,
+    };
+
     /// Parse result containing args and argv (which must stay alive while args is in use)
     pub const ParseResult = struct {
         args: Args,
@@ -138,9 +144,9 @@ pub const Args = struct {
     };
 
     /// Parse command line arguments
-    pub fn parse(allocator: std.mem.Allocator) !ParseResult {
+    pub fn parse(allocator: std.mem.Allocator) ParseError!ParseResult {
         var args = Args{};
-        const argv = try std.process.argsAlloc(allocator);
+        const argv = std.process.argsAlloc(allocator) catch return error.OutOfMemory;
         errdefer std.process.argsFree(allocator, argv);
 
         var i: usize = 1; // Skip program name
@@ -161,16 +167,29 @@ pub const Args = struct {
                 continue;
             }
 
-            if (try parseArg(&args, arg, argv, &i)) continue;
+            if (parseArg(&args, arg, argv, &i)) continue;
 
-            // Unknown args are ignored for fzf compatibility
+            // Check for unknown options (anything starting with - or +)
+            if (arg.len > 0 and (arg[0] == '-' or arg[0] == '+')) {
+                printUnknownOption(arg);
+                return error.UnknownOption;
+            }
+
+            // Non-option arguments are ignored (positional args)
         }
 
         return .{ .args = args, .argv = argv, .allocator = allocator };
     }
 
+    /// Print unknown option error to stderr
+    fn printUnknownOption(arg: []const u8) void {
+        std.fs.File.stderr().writeAll("unknown option: ") catch {};
+        std.fs.File.stderr().writeAll(arg) catch {};
+        std.fs.File.stderr().writeAll("\n") catch {};
+    }
+
     /// Parse a single argument, returns true if handled
-    fn parseArg(args: *Args, arg: []const u8, argv: [][:0]u8, i: *usize) !bool {
+    fn parseArg(args: *Args, arg: []const u8, argv: [][:0]u8, i: *usize) bool {
         inline for (@typeInfo(@TypeOf(meta)).@"struct".fields) |field| {
             const opt = @field(meta, field.name);
 
@@ -206,7 +225,7 @@ pub const Args = struct {
 
             // Handle value options
             if (@hasField(@TypeOf(opt), "takes_value") and opt.takes_value) {
-                if (try parseValueOpt(args, field.name, opt, arg, argv, i)) {
+                if (parseValueOpt(args, field.name, opt, arg, argv, i)) {
                     return true;
                 }
             }
@@ -222,7 +241,7 @@ pub const Args = struct {
         arg: []const u8,
         argv: [][:0]u8,
         i: *usize,
-    ) !bool {
+    ) bool {
         const FieldType = @TypeOf(@field(args.*, field_name));
         const default_int: ?usize = if (@hasField(@TypeOf(opt), "default_int")) opt.default_int else null;
 
