@@ -548,14 +548,17 @@ pub fn runFilter(
     // Sort by score (highest first)
     std.mem.sort(ScoredItem, scored_items.items, {}, ScoredItem.lessThan);
 
-    // Output matching lines
     const stdout = std.fs.File.stdout();
-    const output_delimiter: []const u8 = if (args.print0) "\x00" else "\n";
+    var write_buf: [8192]u8 = undefined;
+    var file_writer = stdout.writer(&write_buf);
+    const writer = &file_writer.interface;
+    const output_delimiter: u8 = if (args.print0) 0 else '\n';
 
     for (scored_items.items) |item| {
-        stdout.writeAll(item.line) catch {};
-        stdout.writeAll(output_delimiter) catch {};
+        writer.writeAll(item.line) catch {};
+        writer.writeByte(output_delimiter) catch {};
     }
+    writer.flush() catch {};
 }
 
 /// Run interactive TUI mode. Returns true if user aborted.
