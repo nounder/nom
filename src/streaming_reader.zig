@@ -183,8 +183,8 @@ pub const StreamingReader = struct {
 
             leftover = data[line_start..];
 
-            // Flush periodically to avoid huge buffers
-            if (lines_buf.items.len >= 1000) {
+            // Flush periodically - use 100 items like fzf for responsiveness
+            if (lines_buf.items.len >= 100) {
                 try self.flushChunk(&lines_buf, slab, nth_ranges, with_nth_ranges);
                 slab = try self.allocator.alloc(u8, SLAB_SIZE);
                 // Preserve leftover data by copying it to the new slab

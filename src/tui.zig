@@ -191,6 +191,7 @@ pub const Tui = struct {
     // Results
     matched_items: std.ArrayList(Item),
     indices_buf: std.ArrayList(u32),
+    showing_all: bool, // When true, render directly from items (no query)
 
     // Display state
     scroll_offset: usize,
@@ -208,6 +209,8 @@ pub const Tui = struct {
     // Running state
     needs_redraw: bool,
     needs_search: bool,
+    last_search_time: i64, // Throttle rapid searches during streaming
+    search_throttle_ms: i64 = 50, // Min time between searches (fzf uses ~50ms)
 
     // For inline mode cleanup
     start_row: u16,
@@ -276,6 +279,7 @@ pub const Tui = struct {
             .cursor_pos = 0,
             .matched_items = .empty,
             .indices_buf = .empty,
+            .showing_all = true,
             .scroll_offset = 0,
             .selected_idx = 0,
             .visible_count = 0,
@@ -285,6 +289,7 @@ pub const Tui = struct {
             .preview_width = 0,
             .needs_redraw = true,
             .needs_search = true,
+            .last_search_time = 0,
             .start_row = 1,
             .lines_used = 0,
         };
@@ -372,8 +377,10 @@ pub const Tui = struct {
         while (true) {
             try self.pollStream();
 
-            if (self.needs_search) {
+            // Throttle searches during rapid input - prevents blocking on large streaming datasets
+            if (self.needs_search and self.shouldPerformSearch()) {
                 try self.performSearch();
+                self.updateLastSearchTime();
                 self.needs_search = false;
                 self.needs_redraw = true;
             }
@@ -437,9 +444,13 @@ pub const Tui = struct {
             }
         }
 
-        // New data means selection/search state is stale; trigger refresh.
         self.total_loaded = self.chunk_list.total_count;
-        self.needs_search = true;
+
+        // Only trigger search if we have an active query
+        // When showing_all (empty query), new items are displayed directly - no search needed
+        if (!self.showing_all) {
+            self.needs_search = true;
+        }
         self.needs_redraw = true;
     }
 
@@ -635,9 +646,52 @@ pub const Tui = struct {
         self.needs_search = true;
     }
 
+    /// Get the count of displayable results (virtual or filtered)
+    fn getResultCount(self: *Tui) usize {
+        return if (self.showing_all) self.items.items.len else self.matched_items.items.len;
+    }
+
+    /// Check if enough time has passed to perform a search (throttle rapid searches)
+    fn shouldPerformSearch(self: *Tui) bool {
+        const now = std.time.milliTimestamp();
+        const elapsed = now - self.last_search_time;
+        return elapsed >= self.search_throttle_ms;
+    }
+
+    /// Update last search time
+    fn updateLastSearchTime(self: *Tui) void {
+        self.last_search_time = std.time.milliTimestamp();
+    }
+
+    /// Get item info at index for rendering (works in both modes)
+    const DisplayItem = struct {
+        display: []const u8,
+        indices: []const u32,
+        selected: bool,
+    };
+
+    fn getDisplayItem(self: *Tui, idx: usize) DisplayItem {
+        if (self.showing_all) {
+            const item_ptr = self.items.items[idx];
+            return .{
+                .display = item_ptr.display,
+                .indices = &[_]u32{},
+                .selected = self.selections.contains(item_ptr.id),
+            };
+        } else {
+            const item = self.matched_items.items[idx];
+            return .{
+                .display = item.item.display,
+                .indices = item.indices,
+                .selected = item.selected,
+            };
+        }
+    }
+
     fn moveUp(self: *Tui) void {
+        const count = self.getResultCount();
         if (self.config.reverse) {
-            if (self.selected_idx + 1 < self.matched_items.items.len) {
+            if (self.selected_idx + 1 < count) {
                 self.selected_idx += 1;
                 self.ensureVisible();
                 self.needs_redraw = true;
@@ -652,6 +706,7 @@ pub const Tui = struct {
     }
 
     fn moveDown(self: *Tui) void {
+        const count = self.getResultCount();
         if (self.config.reverse) {
             if (self.selected_idx > 0) {
                 self.selected_idx -= 1;
@@ -659,7 +714,7 @@ pub const Tui = struct {
                 self.needs_redraw = true;
             }
         } else {
-            if (self.selected_idx + 1 < self.matched_items.items.len) {
+            if (self.selected_idx + 1 < count) {
                 self.selected_idx += 1;
                 self.ensureVisible();
                 self.needs_redraw = true;
@@ -668,9 +723,10 @@ pub const Tui = struct {
     }
 
     fn pageUp(self: *Tui) void {
+        const count = self.getResultCount();
         const page_size = self.visible_count;
         if (self.config.reverse) {
-            self.selected_idx = @min(self.selected_idx + page_size, self.matched_items.items.len -| 1);
+            self.selected_idx = @min(self.selected_idx + page_size, count -| 1);
         } else {
             self.selected_idx -|= page_size;
         }
@@ -679,11 +735,12 @@ pub const Tui = struct {
     }
 
     fn pageDown(self: *Tui) void {
+        const count = self.getResultCount();
         const page_size = self.visible_count;
         if (self.config.reverse) {
             self.selected_idx -|= page_size;
         } else {
-            self.selected_idx = @min(self.selected_idx + page_size, self.matched_items.items.len -| 1);
+            self.selected_idx = @min(self.selected_idx + page_size, count -| 1);
         }
         self.ensureVisible();
         self.needs_redraw = true;
@@ -696,31 +753,41 @@ pub const Tui = struct {
     }
 
     fn scrollToBottom(self: *Tui) void {
-        if (self.matched_items.items.len > 0) {
-            self.selected_idx = self.matched_items.items.len - 1;
+        const count = self.getResultCount();
+        if (count > 0) {
+            self.selected_idx = count - 1;
             self.ensureVisible();
         }
         self.needs_redraw = true;
     }
 
     fn toggleSelection(self: *Tui) void {
-        if (self.matched_items.items.len == 0) return;
+        const count = self.getResultCount();
+        if (count == 0) return;
 
-        const item = &self.matched_items.items[self.selected_idx];
-        const item_id = item.item.id;
+        const item_id = if (self.showing_all)
+            self.items.items[self.selected_idx].id
+        else
+            self.matched_items.items[self.selected_idx].item.id;
 
         if (self.selections.contains(item_id)) {
             _ = self.selections.remove(item_id);
-            item.selected = false;
+            // Update selected flag if in matched_items mode
+            if (!self.showing_all) {
+                self.matched_items.items[self.selected_idx].selected = false;
+            }
         } else {
             self.selections.put(item_id, {}) catch {};
-            item.selected = true;
+            if (!self.showing_all) {
+                self.matched_items.items[self.selected_idx].selected = true;
+            }
         }
         self.needs_redraw = true;
     }
 
     fn ensureVisible(self: *Tui) void {
-        if (self.matched_items.items.len == 0) return;
+        const count = self.getResultCount();
+        if (count == 0) return;
 
         if (self.selected_idx < self.scroll_offset) {
             self.scroll_offset = self.selected_idx;
@@ -730,6 +797,7 @@ pub const Tui = struct {
     }
 
     fn getClickedItemIndex(self: *Tui, row: u16) ?usize {
+        const count = self.getResultCount();
         const list_start: u16 = if (self.config.reverse) 1 else 2;
         const list_end = list_start + @as(u16, @truncate(self.visible_count));
 
@@ -738,13 +806,28 @@ pub const Tui = struct {
         const relative_row = row - list_start;
         const idx = self.scroll_offset + relative_row;
 
-        if (idx < self.matched_items.items.len) {
+        if (idx < count) {
             return idx;
         }
         return null;
     }
 
     fn performSearch(self: *Tui) !void {
+        // Check for empty query first (O(1) path)
+        if (self.query.items.len == 0) {
+            // Free old indices before switching to show-all mode
+            for (self.matched_items.items) |item| {
+                if (item.indices.len > 0) {
+                    self.allocator.free(@constCast(item.indices));
+                }
+            }
+            try self.showAllItems();
+            return;
+        }
+
+        // Has query - switch to filtered mode
+        self.showing_all = false;
+
         // Free old indices
         for (self.matched_items.items) |item| {
             if (item.indices.len > 0) {
@@ -764,11 +847,6 @@ pub const Tui = struct {
 
         var buf: std.ArrayListUnmanaged(u21) = .empty;
         defer buf.deinit(self.allocator);
-
-        if (self.query.items.len == 0) {
-            try self.showAllItems();
-            return;
-        }
 
         var heap = TopKHeap(SearchResult, MAX_RESULTS).init(self.allocator);
         defer heap.deinit();
@@ -837,24 +915,14 @@ pub const Tui = struct {
     }
 
     fn showAllItems(self: *Tui) !void {
-        try self.matched_items.ensureTotalCapacity(self.allocator, self.items.items.len);
+        // O(1) operation: just set flag, render directly from items
+        self.showing_all = true;
+        self.matched_items.clearRetainingCapacity();
 
-        for (self.items.items) |item_ptr| {
-            const is_selected = self.selections.contains(item_ptr.id);
-
-            try self.matched_items.append(self.allocator, .{
-                .item = item_ptr,
-                .score = 0,
-                .indices = &[_]u32{},
-                .selected = is_selected,
-            });
-        }
-
-        if (self.selected_idx >= self.matched_items.items.len) {
-            self.selected_idx = if (self.matched_items.items.len > 0)
-                self.matched_items.items.len - 1
-            else
-                0;
+        // Clamp selection to valid range
+        const total = self.items.items.len;
+        if (self.selected_idx >= total) {
+            self.selected_idx = if (total > 0) total - 1 else 0;
         }
         self.scroll_offset = 0;
         self.ensureVisible();
@@ -939,11 +1007,12 @@ pub const Tui = struct {
             self.total_loaded - self.config.header_lines
         else
             total_items;
+        const result_count = self.getResultCount();
         const info = if (self.loading)
             std.fmt.bufPrint(&buf, "  Loading... {d}", .{self.total_loaded}) catch ""
         else
             std.fmt.bufPrint(&buf, "  {d}/{d}", .{
-                self.matched_items.items.len,
+                result_count,
                 total_display,
             }) catch "";
 
@@ -989,15 +1058,16 @@ pub const Tui = struct {
     }
 
     fn drawList(self: *Tui) !void {
-        const end_idx = @min(self.scroll_offset + self.visible_count, self.matched_items.items.len);
+        const count = self.getResultCount();
+        const end_idx = @min(self.scroll_offset + self.visible_count, count);
 
         var row: usize = 0;
         var idx = self.scroll_offset;
         while (idx < end_idx) : (idx += 1) {
-            const item = self.matched_items.items[idx];
+            const item = self.getDisplayItem(idx);
             const is_current = idx == self.selected_idx;
 
-            try self.drawItem(item, is_current);
+            try self.drawDisplayItem(item, is_current);
             row += 1;
         }
 
@@ -1011,7 +1081,8 @@ pub const Tui = struct {
 
     /// Draw list in fzf-style: best match at bottom, near the prompt
     fn drawListBottomUp(self: *Tui) !void {
-        const end_idx = @min(self.scroll_offset + self.visible_count, self.matched_items.items.len);
+        const count = self.getResultCount();
+        const end_idx = @min(self.scroll_offset + self.visible_count, count);
         const num_items = end_idx - self.scroll_offset;
 
         // First, fill empty rows at top
@@ -1028,14 +1099,14 @@ pub const Tui = struct {
             while (i > 0) {
                 i -= 1;
                 const idx = self.scroll_offset + i;
-                const item = self.matched_items.items[idx];
+                const item = self.getDisplayItem(idx);
                 const is_current = idx == self.selected_idx;
-                try self.drawItem(item, is_current);
+                try self.drawDisplayItem(item, is_current);
             }
         }
     }
 
-    fn drawItem(self: *Tui, item: Item, is_current: bool) !void {
+    fn drawDisplayItem(self: *Tui, item: DisplayItem, is_current: bool) !void {
         try self.term.resetStyle();
 
         // Pointer/marker
@@ -1054,7 +1125,7 @@ pub const Tui = struct {
 
         // Text with highlighting
         const max_width = self.term.width -| 3;
-        try self.drawHighlightedText(item.item.display, item.indices, max_width, is_current);
+        try self.drawHighlightedText(item.display, item.indices, max_width, is_current);
 
         try self.term.clearLineToEnd();
         try self.term.resetStyle();
@@ -1152,9 +1223,16 @@ pub const Tui = struct {
                     try result.selected.append(self.allocator, item_ptr.original);
                 }
             }
-        } else if (self.matched_items.items.len > 0) {
-            // Return current item
-            try result.selected.append(self.allocator, self.matched_items.items[self.selected_idx].item.original);
+        } else {
+            const count = self.getResultCount();
+            if (count > 0) {
+                // Return current item (handle both showing_all and filtered modes)
+                const original = if (self.showing_all)
+                    self.items.items[self.selected_idx].original
+                else
+                    self.matched_items.items[self.selected_idx].item.original;
+                try result.selected.append(self.allocator, original);
+            }
         }
 
         return result;
@@ -1168,9 +1246,15 @@ pub const Tui = struct {
             .aborted = false,
         };
 
-        // Return all matched items
-        for (self.matched_items.items) |item| {
-            try result.selected.append(self.allocator, item.item.original);
+        // Return all results (handle both showing_all and filtered modes)
+        if (self.showing_all) {
+            for (self.items.items) |item_ptr| {
+                try result.selected.append(self.allocator, item_ptr.original);
+            }
+        } else {
+            for (self.matched_items.items) |item| {
+                try result.selected.append(self.allocator, item.item.original);
+            }
         }
 
         return result;
