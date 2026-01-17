@@ -143,6 +143,32 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // ============================================================
+    // fd executable (nom-fd)
+    // ============================================================
+    const fd_exe = b.addExecutable(.{
+        .name = "nom-fd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fd_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nom", .module = mod },
+            },
+        }),
+    });
+
+    b.installArtifact(fd_exe);
+
+    const fd_run_step = b.step("fd", "Run the fd-like file finder");
+    const fd_run_cmd = b.addRunArtifact(fd_exe);
+    fd_run_step.dependOn(&fd_run_cmd.step);
+    fd_run_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        fd_run_cmd.addArgs(args);
+    }
+
     // Install step to copy the binary to ~/bin
     const home_install_step = b.step("home", "Install nom to ~/bin");
     const home = std.posix.getenv("HOME") orelse "/tmp";
