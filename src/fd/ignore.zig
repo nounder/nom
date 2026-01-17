@@ -269,7 +269,6 @@ const IgnoreLevel = struct {
     /// Merged ignore patterns from all sources at this level
     ignore: ?IgnoreFile,
     path_len: usize,
-    has_git: bool, // This directory contains .git
 };
 
 /// Stack of ignore files from root to current directory.
@@ -309,26 +308,16 @@ pub const IgnoreStack = struct {
         if (self.global_fdignore) |gf| gf.deinit(self.allocator);
     }
 
-    /// Check if we're currently in a git repository subtree.
-    /// A subtree is a git repo if any level from root to current has .git.
-    pub fn inGitRepo(self: *IgnoreStack) bool {
-        for (self.levels.items) |level| {
-            if (level.has_git) return true;
-        }
-        return false;
-    }
-
     /// Push a level with pre-loaded ignore patterns onto the stack.
-    pub fn pushLevel(self: *IgnoreStack, ig: ?IgnoreFile, path_len: usize, has_git: bool) !void {
+    pub fn pushLevel(self: *IgnoreStack, ig: ?IgnoreFile, path_len: usize) !void {
         try self.levels.append(self.allocator, .{
             .ignore = ig,
             .path_len = path_len,
-            .has_git = has_git,
         });
     }
 
-    /// Pop the current directory from the stack.
-    pub fn popDir(self: *IgnoreStack) void {
+    /// Pop the current level from the stack.
+    pub fn popLevel(self: *IgnoreStack) void {
         if (self.levels.items.len > 0) {
             if (self.levels.pop()) |level| {
                 if (level.ignore) |ig| ig.deinit(self.allocator);

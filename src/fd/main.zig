@@ -49,7 +49,6 @@ const Args = struct {
     help: bool = false,
     version: bool = false,
     max_results: ?usize = null,
-    one_file_system: bool = false,
 
     // Exclude patterns
     exclude_patterns: std.ArrayListUnmanaged([]const u8) = .{},
@@ -85,7 +84,6 @@ const Args = struct {
         .absolute_path = Opt{ .short = "-a", .long = "--absolute-path" },
         .print0 = Opt{ .short = "-0", .long = "--print0" },
         .follow = Opt{ .short = "-L", .long = "--follow" },
-        .one_file_system = Opt{ .long = "--one-file-system" },
         .max_depth = Opt{ .short = "-d", .long = "--max-depth", .takes_value = true, .short_combined = true },
         .min_depth = Opt{ .long = "--min-depth", .takes_value = true },
         .max_results = Opt{ .long = "--max-results", .takes_value = true },
@@ -423,7 +421,6 @@ pub fn run(allocator: std.mem.Allocator, arg_iter: anytype) !void {
         .read_gitignore = !args.no_ignore and !args.no_ignore_vcs,
         .require_git = !args.no_ignore and !args.no_ignore_vcs,
         .follow_symlinks = args.follow,
-        .one_file_system = args.one_file_system,
         .exclude_patterns = args.exclude_patterns.items,
         .max_results = args.max_results,
     };

@@ -69,7 +69,6 @@ pub const FinderOptions = struct {
     read_gitignore: bool = true,
     require_git: bool = true,
     follow_symlinks: bool = false,
-    one_file_system: bool = false,
     exclude_patterns: []const []const u8 = &.{},
 
     // Result limiting
@@ -115,7 +114,6 @@ pub const Finder = struct {
             .read_gitignore = options.read_gitignore,
             .require_git = options.require_git,
             .follow_symlinks = options.follow_symlinks,
-            .one_file_system = options.one_file_system,
             .max_depth = options.max_depth,
             .min_depth = options.min_depth,
             .exclude_patterns = options.exclude_patterns,

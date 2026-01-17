@@ -1,71 +1,29 @@
-//! Directory walker for fd-zig.
-//!
-//! Provides efficient recursive directory traversal with:
-//! - Depth limiting (min/max)
-//! - Hidden file filtering
-//! - Gitignore support
-//! - Symlink handling
-//! - Filesystem boundary respect
-
 const std = @import("std");
 const ignore = @import("ignore.zig");
 const IgnoreFile = ignore.IgnoreFile;
 const IgnoreStack = ignore.IgnoreStack;
 
-/// Options for directory walking.
 pub const WalkOptions = struct {
-    /// Skip hidden files/directories (starting with .)
     ignore_hidden: bool = true,
-
-    /// Respect .gitignore files
     read_gitignore: bool = true,
-
-    /// Only read .gitignore in git repositories
     require_git: bool = true,
-
-    /// Respect .ignore files
     read_ignore: bool = true,
-
-    /// Respect .fdignore files
     read_fdignore: bool = true,
-
-    /// Follow symbolic links
     follow_symlinks: bool = false,
-
-    /// Stay on the same filesystem
-    one_file_system: bool = false,
-
-    /// Maximum directory depth (null = unlimited)
     max_depth: ?usize = null,
-
-    /// Minimum directory depth for results (null = 0)
     min_depth: ?usize = null,
-
-    /// Patterns to exclude (gitignore-style)
     exclude_patterns: []const []const u8 = &.{},
 };
 
-/// A directory entry returned by the walker.
 pub const Entry = struct {
-    /// Full relative path from the root
     path: []const u8,
-
-    /// Basename (filename only)
+    /// Basename points into `path`
     name: []const u8,
-
-    /// Current depth (0 = root directory contents)
     depth: usize,
-
-    /// Entry type
     kind: std.fs.Dir.Entry.Kind,
-
-    /// Parent directory handle (for stat operations)
     dir: std.fs.Dir,
-
-    /// Cached stat result
     cached_stat: ?std.fs.File.Stat = null,
 
-    /// Get file metadata (lazy-loaded and cached).
     pub fn stat(self: *Entry) !std.fs.File.Stat {
         if (self.cached_stat) |s| return s;
 
@@ -74,7 +32,6 @@ pub const Entry = struct {
         return s;
     }
 
-    /// Check if a directory is empty.
     pub fn isEmpty(self: *Entry) !bool {
         if (self.kind != .directory) return false;
 
@@ -86,23 +43,24 @@ pub const Entry = struct {
     }
 };
 
-/// Stack frame for recursive directory walking.
-const WalkFrame = struct {
+pub const LevelFlag = enum {
+    git,
+};
+
+const WalkLevel = struct {
     iter: std.fs.Dir.Iterator,
     dir: std.fs.Dir,
     path_len: usize,
     depth: usize,
-    owns_dir: bool, // Whether we should close the dir on pop
+    flags: std.EnumSet(LevelFlag),
 };
 
-/// Recursive directory walker with gitignore support.
 pub const Walker = struct {
     allocator: std.mem.Allocator,
     options: WalkOptions,
-    stack: std.ArrayListUnmanaged(WalkFrame),
+    stack: std.ArrayListUnmanaged(WalkLevel),
     path_buf: std.ArrayListUnmanaged(u8),
     ignore_stack: IgnoreStack,
-    root_dev: ?u64 = null,
     started: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, root: []const u8, options: WalkOptions) Walker {
@@ -123,7 +81,13 @@ pub const Walker = struct {
 
     const MAX_IGNORE_SIZE = 1024 * 1024;
 
-    /// Load ignore files from a directory and create a merged IgnoreFile.
+    fn inGitRepo(self: *Walker) bool {
+        for (self.stack.items) |level| {
+            if (level.flags.contains(.git)) return true;
+        }
+        return false;
+    }
+
     fn loadIgnoreFiles(self: *Walker, dir: std.fs.Dir, in_git: bool) !?IgnoreFile {
         var contents: std.ArrayListUnmanaged([]const u8) = .{};
         errdefer {
@@ -131,11 +95,9 @@ pub const Walker = struct {
             contents.deinit(self.allocator);
         }
 
-        // Determine if we should read .gitignore
         const read_gitignore = self.options.read_gitignore and
             (!self.options.require_git or in_git);
 
-        // Load in precedence order (lowest first for last-match-wins)
         if (read_gitignore) {
             if (dir.readFileAlloc(self.allocator, ".gitignore", MAX_IGNORE_SIZE)) |c| {
                 try contents.append(self.allocator, c);
@@ -163,63 +125,52 @@ pub const Walker = struct {
         );
     }
 
-    /// Push a directory onto the ignore stack, loading its ignore files.
-    fn pushDirIgnore(self: *Walker, dir: std.fs.Dir, path_len: usize) !void {
-        // Check for .git (can be directory or file for worktrees/submodules)
-        const has_git = if (dir.access(".git", .{})) |_| true else |_| false;
+    fn pushDirIgnore(self: *Walker, dir: std.fs.Dir, path_len: usize) !std.EnumSet(LevelFlag) {
+        var flags = std.EnumSet(LevelFlag){};
 
-        // Determine if we're in a git repo (including this level)
-        const in_git = has_git or self.ignore_stack.inGitRepo();
+        if (dir.access(".git", .{})) |_| {
+            flags.insert(.git);
+        } else |_| {}
 
-        // Load ignore files
+        const in_git = flags.contains(.git) or self.inGitRepo();
+
         const ig = try self.loadIgnoreFiles(dir, in_git);
 
-        // Push to stack
-        try self.ignore_stack.pushLevel(ig, path_len, has_git);
+        try self.ignore_stack.pushLevel(ig, path_len);
+
+        return flags;
     }
 
     pub fn deinit(self: *Walker) void {
-        // Close all open directories
-        for (self.stack.items) |*frame| {
-            if (frame.owns_dir) {
-                frame.dir.close();
-            }
+        for (self.stack.items) |*level| {
+            level.dir.close();
         }
         self.stack.deinit(self.allocator);
         self.path_buf.deinit(self.allocator);
         self.ignore_stack.deinit();
     }
 
-    /// Start walking from the current directory.
     pub fn start(self: *Walker) !void {
         try self.startAt(std.fs.cwd(), ".");
     }
 
-    /// Start walking from a specific directory.
     pub fn startAt(self: *Walker, dir: std.fs.Dir, path: []const u8) !void {
         _ = path;
         if (self.started) return error.AlreadyStarted;
         self.started = true;
 
-        // Record root filesystem if one_file_system is enabled
-        // Note: one_file_system feature is currently disabled as the high-level
-        // Zig fs.File.Stat doesn't expose the device ID. Would need to use
-        // std.posix.stat directly for this feature.
-        _ = self.options.one_file_system;
-
-        // Open root directory for iteration
         var root_dir = try dir.openDir(".", .{ .iterate = true });
         errdefer root_dir.close();
 
         // Load ignore files for root (path_len = 0)
-        try self.pushDirIgnore(root_dir, 0);
+        const flags = try self.pushDirIgnore(root_dir, 0);
 
         try self.stack.append(self.allocator, .{
             .iter = root_dir.iterateAssumeFirstIteration(),
             .dir = root_dir,
             .path_len = 0,
             .depth = 0,
-            .owns_dir = true,
+            .flags = flags,
         });
     }
 
@@ -227,26 +178,24 @@ pub const Walker = struct {
     pub fn next(self: *Walker) !?Entry {
         while (self.stack.items.len > 0) {
             // Note: We use indices rather than pointers since stack may reallocate
-            const frame_idx = self.stack.items.len - 1;
+            const level_idx = self.stack.items.len - 1;
 
             // Reset path buffer to this directory's prefix
-            self.path_buf.items.len = self.stack.items[frame_idx].path_len;
+            self.path_buf.items.len = self.stack.items[level_idx].path_len;
 
-            const entry = self.stack.items[frame_idx].iter.next() catch |err| switch (err) {
+            const entry = self.stack.items[level_idx].iter.next() catch |err| switch (err) {
                 error.AccessDenied, error.PermissionDenied => continue,
                 else => return err,
             } orelse {
-                // Directory exhausted, pop frame
-                if (self.stack.items[frame_idx].owns_dir) {
-                    self.stack.items[frame_idx].dir.close();
-                }
-                self.ignore_stack.popDir();
+                // Directory exhausted, pop level
+                self.stack.items[level_idx].dir.close();
+                self.ignore_stack.popLevel();
                 _ = self.stack.pop();
                 continue;
             };
 
             // Build relative path (need this first for ignore checks)
-            if (self.stack.items[frame_idx].path_len > 0) {
+            if (self.stack.items[level_idx].path_len > 0) {
                 try self.path_buf.append(self.allocator, '/');
             }
             const name_start = self.path_buf.items.len;
@@ -266,8 +215,8 @@ pub const Walker = struct {
                 }
             }
 
-            const depth = self.stack.items[frame_idx].depth;
-            const parent_dir = self.stack.items[frame_idx].dir;  // Capture before potential realloc
+            const depth = self.stack.items[level_idx].depth;
+            const parent_dir = self.stack.items[level_idx].dir;  // Capture before potential realloc
 
             // Check exclude patterns
             if (self.isExcluded(name, rel_path, is_dir)) continue;
@@ -286,10 +235,6 @@ pub const Walker = struct {
                     true;
 
                 if (can_descend) {
-                    // Check filesystem boundary
-                    // Note: one_file_system feature is disabled (see startAt comment)
-                    _ = self.options.one_file_system;
-
                     // Open and push subdirectory
                     // Note: Even if we can't open the dir, we still return it as a result
                     if (parent_dir.openDir(entry.name, .{ .iterate = true })) |subdir_opened| {
@@ -297,15 +242,15 @@ pub const Walker = struct {
                         errdefer subdir.close();
 
                         const new_path_len = self.path_buf.items.len;
-                        try self.pushDirIgnore(subdir, new_path_len);
+                        const subdir_flags = try self.pushDirIgnore(subdir, new_path_len);
 
-                        // This append may reallocate - don't use frame_idx after this
+                        // This append may reallocate - don't use level_idx after this
                         try self.stack.append(self.allocator, .{
                             .iter = subdir.iterateAssumeFirstIteration(),
                             .dir = subdir,
                             .path_len = new_path_len,
                             .depth = depth + 1,
-                            .owns_dir = true,
+                            .flags = subdir_flags,
                         });
                     } else |err| switch (err) {
                         error.AccessDenied, error.PermissionDenied, error.FileNotFound => {
