@@ -49,6 +49,7 @@ pub const Tui = @import("tui.zig").Tui;
 pub const TuiConfig = @import("tui.zig").TuiConfig;
 pub const TuiResult = @import("tui.zig").TuiResult;
 pub const PreviewWindow = @import("tui.zig").PreviewWindow;
+pub const ChunkSource = @import("tui.zig").ChunkSource;
 pub const Terminal = @import("term.zig").Terminal;
 
 // Preview

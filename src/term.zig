@@ -10,8 +10,8 @@
 const std = @import("std");
 const posix = std.posix;
 
-/// Size of write buffer - 64KB should be enough for most screens
-const WRITE_BUFFER_SIZE = 64 * 1024;
+/// Size of write buffer - 4KB fits in CPU cache and avoids stack overflow
+const WRITE_BUFFER_SIZE = 4 * 1024;
 
 /// Terminal state for raw mode
 pub const Terminal = struct {
@@ -27,6 +27,19 @@ pub const Terminal = struct {
 
     /// Initialize terminal and enter raw mode
     pub fn init() !Terminal {
+        // Ignore SIGTTOU during terminal setup. When stdin is redirected (piped),
+        // the process becomes a "background" process relative to the TTY, and
+        // tcsetattr will trigger SIGTTOU which stops the process by default.
+        // Go's runtime ignores SIGTTOU automatically via _SigIgn flag - we do it explicitly.
+        var old_action: posix.Sigaction = undefined;
+        const ignore_action = posix.Sigaction{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.TTOU, &ignore_action, &old_action);
+        defer posix.sigaction(posix.SIG.TTOU, &old_action, null);
+
         // Open /dev/tty for reading (user input)
         const ttyin = std.fs.cwd().openFile("/dev/tty", .{ .mode = .read_only }) catch
             return error.NoTTY;

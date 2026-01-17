@@ -11,6 +11,8 @@ const std = @import("std");
 const nom = @import("root.zig");
 const files = @import("files.zig");
 const StreamingReader = @import("streaming_reader.zig").StreamingReader;
+const StreamingWalker = files.StreamingWalker;
+const ChunkSource = nom.ChunkSource;
 
 const CaseMatching = nom.CaseMatching;
 const Normalization = nom.Normalization;
@@ -721,7 +723,7 @@ pub fn runTuiStreaming(
         .preview_window = preview_window,
     };
 
-    var tui = try nom.Tui.init(allocator, &.{}, tui_config, reader);
+    var tui = try nom.Tui.init(allocator, &.{}, tui_config, ChunkSource{ .reader = reader });
     defer tui.deinit();
 
     if (args.query) |q| {
@@ -742,6 +744,91 @@ pub fn runTuiStreaming(
 
     if (result.aborted) {
         return true; // Signal abort to caller
+    }
+
+    for (result.selected.items) |item| {
+        stdout.writeAll(item) catch {};
+        stdout.writeAll(output_delimiter) catch {};
+    }
+
+    return false;
+}
+
+/// Run interactive TUI mode with streaming file walker. Returns true if user aborted.
+pub fn runTuiWithWalker(
+    allocator: std.mem.Allocator,
+    args: *const Args,
+    walker: *StreamingWalker,
+) !bool {
+    const case_matching: CaseMatching = if (args.case_sensitive)
+        .respect
+    else if (args.smart_case)
+        .smart
+    else
+        .ignore;
+
+    // Parse height option
+    var fullscreen = false;
+    var height: ?u16 = null;
+    if (args.height) |h| {
+        if (std.mem.eql(u8, h, "100%")) {
+            fullscreen = true;
+        } else if (std.mem.endsWith(u8, h, "%")) {
+            const pct = std.fmt.parseInt(u16, h[0 .. h.len - 1], 10) catch 50;
+            height = @max(5, pct / 5);
+        } else {
+            height = std.fmt.parseInt(u16, h, 10) catch null;
+        }
+    }
+
+    // Parse preview window options
+    const preview_window = if (args.preview_window) |pw_spec|
+        nom.PreviewWindow.parse(pw_spec)
+    else
+        nom.PreviewWindow{};
+
+    const tui_config = nom.TuiConfig{
+        .prompt = args.prompt,
+        .pointer = args.pointer,
+        .marker = args.marker,
+        .header = args.header,
+        .header_lines = args.header_lines,
+        .multi = args.multi,
+        .reverse = args.reverse,
+        .no_mouse = args.no_mouse,
+        .ansi = args.ansi,
+        .case_matching = case_matching,
+        .exact = args.exact,
+        .fullscreen = fullscreen,
+        .height = height,
+        .delimiter = args.delimiter,
+        .nth = args.nth,
+        .with_nth = args.with_nth,
+        .preview = args.preview,
+        .preview_window = preview_window,
+    };
+
+    var tui = try nom.Tui.init(allocator, &.{}, tui_config, ChunkSource{ .walker = walker });
+    defer tui.deinit();
+
+    if (args.query) |q| {
+        try tui.setQuery(q);
+    }
+
+    var result = try tui.run();
+    defer result.deinit();
+
+    // Output results
+    const stdout = std.fs.File.stdout();
+    const output_delimiter: []const u8 = if (args.print0) "\x00" else "\n";
+
+    if (args.print_query) {
+        stdout.writeAll(result.query) catch {};
+        stdout.writeAll(output_delimiter) catch {};
+    }
+
+    if (result.aborted) {
+        return true;
     }
 
     for (result.selected.items) |item| {

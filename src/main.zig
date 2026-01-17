@@ -6,7 +6,9 @@
 
 const std = @import("std");
 const fzf = @import("fzf.zig");
+const files = @import("files.zig");
 const StreamingReader = @import("streaming_reader.zig").StreamingReader;
+const StreamingWalker = files.StreamingWalker;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -42,9 +44,19 @@ pub fn main() !void {
 
     // Run interactive TUI
     const aborted = try if (stdin_is_tty) blk: {
-        const input = try fzf.getDefaultSource(allocator);
-        defer allocator.free(input);
-        break :blk fzf.runTui(allocator, &args, input);
+        // Check for FZF_DEFAULT_COMMAND first
+        if (std.posix.getenv("FZF_DEFAULT_COMMAND")) |_| {
+            // Use the command output (non-streaming for now)
+            const input = try fzf.getDefaultSource(allocator);
+            defer allocator.free(input);
+            break :blk fzf.runTui(allocator, &args, input);
+        } else {
+            // Use streaming file walker for built-in directory walking
+            var walker = StreamingWalker.init(allocator);
+            defer walker.deinit();
+            try walker.start();
+            break :blk fzf.runTuiWithWalker(allocator, &args, &walker);
+        }
     } else blk: {
         var reader = StreamingReader.init(allocator, args.delimiter, args.header_lines, args.nth, args.with_nth);
         defer reader.deinit();

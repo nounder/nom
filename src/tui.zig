@@ -18,9 +18,37 @@ const Key = input.Key;
 const InputReader = input.InputReader;
 const chunk = @import("chunklist.zig");
 const StreamingReader = @import("streaming_reader.zig").StreamingReader;
+const StreamingWalker = @import("files.zig").StreamingWalker;
 const ParsedNth = @import("streaming_reader.zig").ParsedNth;
 const TopKHeap = @import("topk.zig").TopKHeap;
 const PreviewRunner = @import("preview.zig").PreviewRunner;
+
+/// Union type for streaming sources (stdin reader or file walker)
+pub const ChunkSource = union(enum) {
+    reader: *StreamingReader,
+    walker: *StreamingWalker,
+
+    pub fn pollChunk(self: ChunkSource) ?chunk.Chunk {
+        return switch (self) {
+            .reader => |r| r.pollChunk(),
+            .walker => |w| w.pollChunk(),
+        };
+    }
+
+    pub fn isDone(self: ChunkSource) bool {
+        return switch (self) {
+            .reader => |r| r.isDone(),
+            .walker => |w| w.isDone(),
+        };
+    }
+
+    pub fn checkError(self: ChunkSource) !void {
+        return switch (self) {
+            .reader => |r| r.checkError(),
+            .walker => |w| w.checkError(),
+        };
+    }
+};
 
 const nom = @import("root.zig");
 const Matcher = nom.Matcher;
@@ -178,7 +206,7 @@ pub const Tui = struct {
     chunk_list: chunk.ChunkList,
     items: std.ArrayList(*const chunk.ChunkItem),
     header_items: std.ArrayList(*const chunk.ChunkItem),
-    stream_reader: ?*StreamingReader,
+    chunk_source: ?ChunkSource,
     loading: bool,
     total_loaded: usize,
 
@@ -227,7 +255,7 @@ pub const Tui = struct {
         allocator: Allocator,
         items: []const []const u8,
         config: TuiConfig,
-        stream_reader: ?*StreamingReader,
+        chunk_source: ?ChunkSource,
     ) !Tui {
         var term = try Terminal.init();
         errdefer term.deinit();
@@ -278,8 +306,8 @@ pub const Tui = struct {
             .chunk_list = chunk_list,
             .items = item_list,
             .header_items = header_list,
-            .stream_reader = stream_reader,
-            .loading = stream_reader != null,
+            .chunk_source = chunk_source,
+            .loading = chunk_source != null,
             .total_loaded = chunk_list.total_count,
             .matcher = matcher,
             .query = .empty,
@@ -394,7 +422,7 @@ pub const Tui = struct {
         }
 
         // Start in "loading" mode when streaming; initial draw happens before any search.
-        self.loading = if (self.stream_reader) |r| !r.isDone() else false;
+        self.loading = if (self.chunk_source) |s| !s.isDone() else false;
         self.total_loaded = self.chunk_list.total_count;
         self.needs_redraw = true;
         try self.draw();
@@ -505,20 +533,20 @@ pub const Tui = struct {
     }
 
     fn pollStream(self: *Tui) !void {
-        const reader = self.stream_reader orelse return;
+        const source = self.chunk_source orelse return;
 
         const prev_loading = self.loading;
 
-        while (reader.pollChunk()) |c| {
+        while (source.pollChunk()) |c| {
             try self.addChunk(c);
         }
 
-        self.loading = !reader.isDone();
+        self.loading = !source.isDone();
         self.total_loaded = self.chunk_list.total_count;
         if (self.loading != prev_loading) {
             self.needs_redraw = true;
         }
-        try reader.checkError();
+        try source.checkError();
     }
 
     fn addChunk(self: *Tui, c: chunk.Chunk) !void {
