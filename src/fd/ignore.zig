@@ -10,15 +10,15 @@
 
 const std = @import("std");
 
-/// A compiled gitignore pattern.
-pub const GitignorePattern = struct {
+/// A compiled ignore pattern.
+pub const IgnorePattern = struct {
     pattern: []const u8,
     is_negation: bool,
     is_dir_only: bool,
     anchored: bool,
 
     /// Match a path against this pattern.
-    pub fn matches(self: GitignorePattern, name: []const u8, rel_path: []const u8, is_dir: bool) bool {
+    pub fn matches(self: IgnorePattern, name: []const u8, rel_path: []const u8, is_dir: bool) bool {
         if (self.is_dir_only and !is_dir) return false;
 
         if (self.anchored) {
@@ -127,45 +127,79 @@ fn matchCharClass(class: []const u8, c: u8) bool {
     return if (negated) !matched else matched;
 }
 
-/// Manages gitignore patterns for a single directory level.
-pub const Gitignore = struct {
-    patterns: []GitignorePattern,
-    content: []const u8,
+/// Manages ignore patterns for a single directory level.
+/// Can hold merged patterns from multiple sources (.gitignore, .ignore, .fdignore).
+pub const IgnoreFile = struct {
+    patterns: []IgnorePattern,
+    /// Owned content buffers (one per source file that was merged)
+    contents: [][]const u8,
 
-    pub fn deinit(self: Gitignore, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: IgnoreFile, allocator: std.mem.Allocator) void {
         allocator.free(self.patterns);
-        allocator.free(self.content);
-    }
-
-    pub fn load(allocator: std.mem.Allocator, dir: std.fs.Dir) !?Gitignore {
-        return loadFile(allocator, dir, ".gitignore");
-    }
-
-    /// Load ignore patterns from a specific file in a directory.
-    pub fn loadFile(allocator: std.mem.Allocator, dir: std.fs.Dir, filename: []const u8) !?Gitignore {
-        const content = dir.readFileAlloc(allocator, filename, 1024 * 1024) catch |err| switch (err) {
-            error.FileNotFound, error.AccessDenied, error.PermissionDenied => return null,
-            else => return err,
-        };
-        return parseContent(allocator, content);
+        for (self.contents) |c| {
+            allocator.free(c);
+        }
+        allocator.free(self.contents);
     }
 
     /// Load ignore patterns from an absolute path.
-    pub fn loadAbsolute(allocator: std.mem.Allocator, path: []const u8) !?Gitignore {
+    pub fn loadAbsolute(allocator: std.mem.Allocator, path: []const u8) !?IgnoreFile {
         const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound, error.AccessDenied, error.PermissionDenied => return null,
             else => return err,
         };
-        return parseContent(allocator, content);
-    }
-
-    /// Parse ignore content into a Gitignore struct.
-    fn parseContent(allocator: std.mem.Allocator, content: []u8) !?Gitignore {
         errdefer allocator.free(content);
 
-        var patterns: std.ArrayListUnmanaged(GitignorePattern) = .{};
+        var patterns: std.ArrayListUnmanaged(IgnorePattern) = .{};
         errdefer patterns.deinit(allocator);
 
+        parseInto(allocator, content, &patterns);
+
+        if (patterns.items.len == 0) {
+            allocator.free(content);
+            return null;
+        }
+
+        // Create a single-element contents array
+        const contents = try allocator.alloc([]const u8, 1);
+        contents[0] = content;
+
+        return .{
+            .patterns = try patterns.toOwnedSlice(allocator),
+            .contents = contents,
+        };
+    }
+
+    /// Create IgnoreFile from pre-read content buffers.
+    /// Contents should be in precedence order (lowest first for last-match-wins).
+    /// Takes ownership of the content slices.
+    pub fn fromContents(allocator: std.mem.Allocator, contents: [][]const u8) !?IgnoreFile {
+        if (contents.len == 0) {
+            allocator.free(contents);
+            return null;
+        }
+
+        var patterns: std.ArrayListUnmanaged(IgnorePattern) = .{};
+        errdefer patterns.deinit(allocator);
+
+        for (contents) |content| {
+            parseInto(allocator, content, &patterns);
+        }
+
+        if (patterns.items.len == 0) {
+            for (contents) |c| allocator.free(c);
+            allocator.free(contents);
+            return null;
+        }
+
+        return .{
+            .patterns = try patterns.toOwnedSlice(allocator),
+            .contents = contents,
+        };
+    }
+
+    /// Parse ignore file content and append patterns to the list.
+    fn parseInto(allocator: std.mem.Allocator, content: []const u8, patterns: *std.ArrayListUnmanaged(IgnorePattern)) void {
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -195,27 +229,17 @@ pub const Gitignore = struct {
                 anchored = true;
             }
 
-            try patterns.append(allocator, .{
+            patterns.append(allocator, .{
                 .pattern = pat,
                 .is_negation = is_negation,
                 .is_dir_only = is_dir_only,
                 .anchored = anchored,
-            });
+            }) catch {};
         }
-
-        if (patterns.items.len == 0) {
-            allocator.free(content);
-            return null;
-        }
-
-        return .{
-            .patterns = try patterns.toOwnedSlice(allocator),
-            .content = content,
-        };
     }
 
     /// Check if a path should be ignored. Returns null if no pattern matches.
-    pub fn check(self: Gitignore, name: []const u8, rel_path: []const u8, is_dir: bool) ?bool {
+    pub fn check(self: IgnoreFile, name: []const u8, rel_path: []const u8, is_dir: bool) ?bool {
         var result: ?bool = null;
         for (self.patterns) |p| {
             if (p.matches(name, rel_path, is_dir)) {
@@ -242,30 +266,29 @@ pub const IgnoreOptions = struct {
 
 /// A level in the ignore stack.
 const IgnoreLevel = struct {
-    gitignore: ?Gitignore,
-    fdignore: ?Gitignore,
-    ignore: ?Gitignore,
+    /// Merged ignore patterns from all sources at this level
+    ignore: ?IgnoreFile,
     path_len: usize,
     has_git: bool, // This directory contains .git
 };
 
-/// Stack of gitignore files from root to current directory.
+/// Stack of ignore files from root to current directory.
 /// Implements proper gitignore hierarchy with last-match-wins semantics.
 pub const IgnoreStack = struct {
     allocator: std.mem.Allocator,
     options: IgnoreOptions,
     levels: std.ArrayListUnmanaged(IgnoreLevel),
-    global_fdignore: ?Gitignore,
+    global_fdignore: ?IgnoreFile,
 
     pub fn init(allocator: std.mem.Allocator, options: IgnoreOptions) IgnoreStack {
         // Load global ~/.fdignore
-        var global_fdignore: ?Gitignore = null;
+        var global_fdignore: ?IgnoreFile = null;
         if (options.read_global_fdignore) {
             if (std.posix.getenv("HOME")) |home| {
                 var path_buf: [std.fs.max_path_bytes]u8 = undefined;
                 const path = std.fmt.bufPrint(&path_buf, "{s}/.fdignore", .{home}) catch null;
                 if (path) |p| {
-                    global_fdignore = Gitignore.loadAbsolute(allocator, p) catch null;
+                    global_fdignore = IgnoreFile.loadAbsolute(allocator, p) catch null;
                 }
             }
         }
@@ -280,9 +303,7 @@ pub const IgnoreStack = struct {
 
     pub fn deinit(self: *IgnoreStack) void {
         for (self.levels.items) |level| {
-            if (level.gitignore) |gi| gi.deinit(self.allocator);
-            if (level.fdignore) |fi| fi.deinit(self.allocator);
-            if (level.ignore) |ii| ii.deinit(self.allocator);
+            if (level.ignore) |ig| ig.deinit(self.allocator);
         }
         self.levels.deinit(self.allocator);
         if (self.global_fdignore) |gf| gf.deinit(self.allocator);
@@ -290,49 +311,17 @@ pub const IgnoreStack = struct {
 
     /// Check if we're currently in a git repository subtree.
     /// A subtree is a git repo if any level from root to current has .git.
-    fn inGitRepo(self: *IgnoreStack) bool {
+    pub fn inGitRepo(self: *IgnoreStack) bool {
         for (self.levels.items) |level| {
             if (level.has_git) return true;
         }
         return false;
     }
 
-    /// Push a directory onto the stack, loading its ignore files if present.
-    /// path_len is the length of the relative path to this directory (0 for root).
-    pub fn pushDir(self: *IgnoreStack, dir: std.fs.Dir, path_len: usize) !void {
-        // Check for .git directory at this level
-        // .git can be a directory (normal repo) or a file (worktree/submodule)
-        // Use access() which works for both
-        const has_git = if (dir.access(".git", .{})) |_| true else |_| false;
-
-        var gitignore: ?Gitignore = null;
-        var fdignore: ?Gitignore = null;
-        var dot_ignore: ?Gitignore = null;
-
-        // Load .gitignore (only in git repos if require_git is set)
-        if (self.options.read_gitignore) {
-            // Check if this subtree is a git repo (current level or any parent has .git)
-            const in_git = has_git or self.inGitRepo();
-            const should_read = !self.options.require_git or in_git;
-            if (should_read) {
-                gitignore = try Gitignore.load(self.allocator, dir);
-            }
-        }
-
-        // Load .fdignore (always, if enabled)
-        if (self.options.read_fdignore) {
-            fdignore = try Gitignore.loadFile(self.allocator, dir, ".fdignore");
-        }
-
-        // Load .ignore (always, if enabled)
-        if (self.options.read_ignore) {
-            dot_ignore = try Gitignore.loadFile(self.allocator, dir, ".ignore");
-        }
-
+    /// Push a level with pre-loaded ignore patterns onto the stack.
+    pub fn pushLevel(self: *IgnoreStack, ig: ?IgnoreFile, path_len: usize, has_git: bool) !void {
         try self.levels.append(self.allocator, .{
-            .gitignore = gitignore,
-            .fdignore = fdignore,
-            .ignore = dot_ignore,
+            .ignore = ig,
             .path_len = path_len,
             .has_git = has_git,
         });
@@ -342,9 +331,7 @@ pub const IgnoreStack = struct {
     pub fn popDir(self: *IgnoreStack) void {
         if (self.levels.items.len > 0) {
             if (self.levels.pop()) |level| {
-                if (level.gitignore) |gi| gi.deinit(self.allocator);
-                if (level.fdignore) |fi| fi.deinit(self.allocator);
-                if (level.ignore) |ii| ii.deinit(self.allocator);
+                if (level.ignore) |ig| ig.deinit(self.allocator);
             }
         }
     }
@@ -361,15 +348,10 @@ pub const IgnoreStack = struct {
             else
                 name;
 
-            // Check each ignore source
-            const sources = [_]?Gitignore{ level.gitignore, level.ignore, level.fdignore };
-            for (sources) |maybe_gi| {
-                if (maybe_gi) |gi| {
-                    // Look for negation patterns that explicitly include this path
-                    for (gi.patterns) |p| {
-                        if (p.is_negation and p.matches(name, level_rel, is_dir)) {
-                            return true;
-                        }
+            if (level.ignore) |ig| {
+                for (ig.patterns) |p| {
+                    if (p.is_negation and p.matches(name, level_rel, is_dir)) {
+                        return true;
                     }
                 }
             }
@@ -378,15 +360,12 @@ pub const IgnoreStack = struct {
     }
 
     /// Check if a path should be ignored.
-    /// Priority (highest wins):
-    /// 1. Global ~/.fdignore (always wins - user's personal preferences)
-    /// 2. Per-level .fdignore
-    /// 3. Per-level .ignore
-    /// 4. Per-level .gitignore
+    /// Patterns are checked in order with last-match-wins semantics.
+    /// Global ~/.fdignore has highest priority.
     pub fn isIgnored(self: *IgnoreStack, name: []const u8, rel_path: []const u8, is_dir: bool) bool {
         var result: ?bool = null;
 
-        // Check each directory level (gitignore -> .ignore -> .fdignore)
+        // Check each directory level
         for (self.levels.items) |level| {
             // Compute path relative to this level's location
             const level_rel = if (level.path_len == 0)
@@ -396,30 +375,14 @@ pub const IgnoreStack = struct {
             else
                 name;
 
-            // Check .gitignore
-            if (level.gitignore) |gi| {
-                if (gi.check(name, level_rel, is_dir)) |r| {
-                    result = r;
-                }
-            }
-
-            // Check .ignore (overrides .gitignore)
-            if (level.ignore) |ii| {
-                if (ii.check(name, level_rel, is_dir)) |r| {
-                    result = r;
-                }
-            }
-
-            // Check .fdignore (overrides .ignore and .gitignore)
-            if (level.fdignore) |fi| {
-                if (fi.check(name, level_rel, is_dir)) |r| {
+            if (level.ignore) |ig| {
+                if (ig.check(name, level_rel, is_dir)) |r| {
                     result = r;
                 }
             }
         }
 
         // Global ~/.fdignore has highest priority - cannot be overridden by local patterns
-        // This matches fd's behavior where global fdignore represents user preferences
         if (self.global_fdignore) |gf| {
             if (gf.check(name, rel_path, is_dir)) |r| {
                 result = r;
@@ -463,8 +426,8 @@ test "globMatch character class" {
     try std.testing.expect(globMatch("[!a-z]", "A"));
 }
 
-test "GitignorePattern.matches" {
-    const p1 = GitignorePattern{
+test "IgnorePattern.matches" {
+    const p1 = IgnorePattern{
         .pattern = "*.log",
         .is_negation = false,
         .is_dir_only = false,
@@ -473,7 +436,7 @@ test "GitignorePattern.matches" {
     try std.testing.expect(p1.matches("debug.log", "debug.log", false));
     try std.testing.expect(p1.matches("debug.log", "foo/debug.log", false));
 
-    const p2 = GitignorePattern{
+    const p2 = IgnorePattern{
         .pattern = "build",
         .is_negation = false,
         .is_dir_only = false,
@@ -482,7 +445,7 @@ test "GitignorePattern.matches" {
     try std.testing.expect(p2.matches("build", "build", true));
     try std.testing.expect(!p2.matches("build", "src/build", true));
 
-    const p3 = GitignorePattern{
+    const p3 = IgnorePattern{
         .pattern = "logs",
         .is_negation = false,
         .is_dir_only = true,

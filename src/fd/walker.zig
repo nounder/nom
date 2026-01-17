@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const ignore = @import("ignore.zig");
-const Gitignore = ignore.Gitignore;
+const IgnoreFile = ignore.IgnoreFile;
 const IgnoreStack = ignore.IgnoreStack;
 
 /// Options for directory walking.
@@ -22,6 +22,12 @@ pub const WalkOptions = struct {
 
     /// Only read .gitignore in git repositories
     require_git: bool = true,
+
+    /// Respect .ignore files
+    read_ignore: bool = true,
+
+    /// Respect .fdignore files
+    read_fdignore: bool = true,
 
     /// Follow symbolic links
     follow_symlinks: bool = false,
@@ -109,8 +115,67 @@ pub const Walker = struct {
             .ignore_stack = IgnoreStack.init(allocator, .{
                 .read_gitignore = options.read_gitignore,
                 .require_git = options.require_git,
+                .read_ignore = options.read_ignore,
+                .read_fdignore = options.read_fdignore,
             }),
         };
+    }
+
+    const MAX_IGNORE_SIZE = 1024 * 1024;
+
+    /// Load ignore files from a directory and create a merged IgnoreFile.
+    fn loadIgnoreFiles(self: *Walker, dir: std.fs.Dir, in_git: bool) !?IgnoreFile {
+        var contents: std.ArrayListUnmanaged([]const u8) = .{};
+        errdefer {
+            for (contents.items) |c| self.allocator.free(c);
+            contents.deinit(self.allocator);
+        }
+
+        // Determine if we should read .gitignore
+        const read_gitignore = self.options.read_gitignore and
+            (!self.options.require_git or in_git);
+
+        // Load in precedence order (lowest first for last-match-wins)
+        if (read_gitignore) {
+            if (dir.readFileAlloc(self.allocator, ".gitignore", MAX_IGNORE_SIZE)) |c| {
+                try contents.append(self.allocator, c);
+            } else |_| {}
+        }
+        if (self.options.read_ignore) {
+            if (dir.readFileAlloc(self.allocator, ".ignore", MAX_IGNORE_SIZE)) |c| {
+                try contents.append(self.allocator, c);
+            } else |_| {}
+        }
+        if (self.options.read_fdignore) {
+            if (dir.readFileAlloc(self.allocator, ".fdignore", MAX_IGNORE_SIZE)) |c| {
+                try contents.append(self.allocator, c);
+            } else |_| {}
+        }
+
+        if (contents.items.len == 0) {
+            contents.deinit(self.allocator);
+            return null;
+        }
+
+        return try IgnoreFile.fromContents(
+            self.allocator,
+            try contents.toOwnedSlice(self.allocator),
+        );
+    }
+
+    /// Push a directory onto the ignore stack, loading its ignore files.
+    fn pushDirIgnore(self: *Walker, dir: std.fs.Dir, path_len: usize) !void {
+        // Check for .git (can be directory or file for worktrees/submodules)
+        const has_git = if (dir.access(".git", .{})) |_| true else |_| false;
+
+        // Determine if we're in a git repo (including this level)
+        const in_git = has_git or self.ignore_stack.inGitRepo();
+
+        // Load ignore files
+        const ig = try self.loadIgnoreFiles(dir, in_git);
+
+        // Push to stack
+        try self.ignore_stack.pushLevel(ig, path_len, has_git);
     }
 
     pub fn deinit(self: *Walker) void {
@@ -146,8 +211,8 @@ pub const Walker = struct {
         var root_dir = try dir.openDir(".", .{ .iterate = true });
         errdefer root_dir.close();
 
-        // Load gitignore for root (path_len = 0)
-        try self.ignore_stack.pushDir(root_dir, 0);
+        // Load ignore files for root (path_len = 0)
+        try self.pushDirIgnore(root_dir, 0);
 
         try self.stack.append(self.allocator, .{
             .iter = root_dir.iterateAssumeFirstIteration(),
@@ -232,7 +297,7 @@ pub const Walker = struct {
                         errdefer subdir.close();
 
                         const new_path_len = self.path_buf.items.len;
-                        try self.ignore_stack.pushDir(subdir, new_path_len);
+                        try self.pushDirIgnore(subdir, new_path_len);
 
                         // This append may reallocate - don't use frame_idx after this
                         try self.stack.append(self.allocator, .{

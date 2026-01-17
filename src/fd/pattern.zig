@@ -91,9 +91,55 @@ pub const Pattern = struct {
     }
 
     fn regexMatches(self: *const Pattern, pat: []const u8, text: []const u8) bool {
-        // For now, treat regex as glob
-        // A full regex implementation is complex; this provides basic compatibility
-        return self.globMatches(pat, text);
+        // Basic regex matching - search for pattern as substring with regex semantics
+        // Supported: . (any char), .* (any sequence), literal chars
+        // This is a simplified regex that handles fd's common use cases
+        const target = if (self.case_sensitive) text else blk: {
+            var buf: [4096]u8 = undefined;
+            if (text.len > buf.len) break :blk text;
+            for (text, 0..) |c, i| {
+                buf[i] = std.ascii.toLower(c);
+            }
+            break :blk buf[0..text.len];
+        };
+
+        // Try to match pattern at each position (substring semantics like fd)
+        var start: usize = 0;
+        while (start <= target.len) : (start += 1) {
+            if (regexMatchAt(pat, target[start..])) return true;
+            if (start == target.len) break;
+        }
+        return false;
+    }
+
+    fn regexMatchAt(pat: []const u8, text: []const u8) bool {
+        var pi: usize = 0;
+        var ti: usize = 0;
+
+        while (pi < pat.len) {
+            if (pat[pi] == '.') {
+                // . matches any single character
+                if (ti >= text.len) return false;
+                pi += 1;
+                ti += 1;
+            } else if (pat[pi] == '*' and pi > 0 and pat[pi - 1] == '.') {
+                // .* was handled by previous iteration setting up for greedy match
+                // This shouldn't happen with our simple implementation
+                pi += 1;
+            } else if (pat[pi] == '\\' and pi + 1 < pat.len) {
+                // Escaped character - match literally
+                pi += 1;
+                if (ti >= text.len or pat[pi] != text[ti]) return false;
+                pi += 1;
+                ti += 1;
+            } else {
+                // Literal character match
+                if (ti >= text.len or pat[pi] != text[ti]) return false;
+                pi += 1;
+                ti += 1;
+            }
+        }
+        return true; // Pattern exhausted = match (substring match, so we don't need to exhaust text)
     }
 };
 

@@ -394,13 +394,13 @@ pub fn run(allocator: std.mem.Allocator, arg_iter: anytype) !void {
         null; // smart case
 
     // Determine pattern kind
-    // fd default: regex (substring matching), -g for glob, -F for fixed
+    // fd default: regex, -g for glob, -F for fixed
     const pattern_kind: fd.PatternKind = if (args.fixed_strings)
         .fixed
     else if (args.glob)
         .glob
     else
-        .fixed; // Default to substring matching like fd
+        .regex; // Default to regex like fd
 
     // Adjust depths: fd uses 1-based depth, walker uses 0-based
     // fd -d 1 means only direct children (depth 0 in walker)
