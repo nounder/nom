@@ -203,16 +203,20 @@ pub const Matcher = struct {
         // Find best score in last row
         const last_row_off = view_mut.row_offs[needle.len - 1];
         const relative_last_row_off = @as(usize, last_row_off) + 1 - needle.len;
+        const haystack_len = end - start;
+        // The valid range in current_row is from relative_last_row_off to (haystack_len - needle_len + 1)
+        const scan_end = haystack_len + 1 - needle.len;
 
         var best_score: u16 = 0;
         var best_end: u16 = 0;
 
-        for (view_mut.current_row[relative_last_row_off..], 0..) |cell, i| {
+        for (view_mut.current_row[relative_last_row_off..scan_end], 0..) |cell, i| {
             if (cell.score_val > best_score) {
                 best_score = cell.score_val;
                 best_end = @intCast(i);
             }
         }
+
 
         if (compute_indices) {
             view_mut.reconstructOptimalPath(best_end, self.allocator, indices, matrix_len, @intCast(start));
@@ -1023,4 +1027,70 @@ test "no match" {
 
     const result = matcher.fuzzyMatch(haystack, needle);
     try std.testing.expect(result == null);
+}
+
+test "path matching - contiguous match should beat gap match" {
+    var matcher = try Matcher.initDefault(std.testing.allocator);
+    defer matcher.deinit();
+    matcher.config = matcher.config.matchPaths();
+
+    // Test "bin/nom" - exact contiguous match at word boundary
+    {
+        const needle = Utf32Str{ .ascii = "nom" };
+        const haystack = Utf32Str{ .ascii = "bin/nom" };
+
+        var indices: std.ArrayListUnmanaged(u32) = .empty;
+        defer indices.deinit(std.testing.allocator);
+        const score1 = matcher.fuzzyIndices(haystack, needle, &indices);
+
+        try std.testing.expect(score1 != null);
+        // Contiguous match at word boundary should score high
+        try std.testing.expect(score1.? >= 80);
+        // Should match positions 4, 5, 6 (the "nom" part, not the "n" in "bin")
+        try std.testing.expectEqual(@as(usize, 3), indices.items.len);
+        try std.testing.expectEqual(@as(u32, 4), indices.items[0]);
+        try std.testing.expectEqual(@as(u32, 5), indices.items[1]);
+        try std.testing.expectEqual(@as(u32, 6), indices.items[2]);
+    }
+
+    // Test "noprompt" - match with gap should score lower
+    {
+        const needle = Utf32Str{ .ascii = "nom" };
+        const haystack = Utf32Str{ .ascii = "dotfiles/bin/noprompt" };
+        const score2 = matcher.fuzzyMatch(haystack, needle);
+
+        try std.testing.expect(score2 != null);
+        // Gap match should score lower than contiguous
+        try std.testing.expect(score2.? < 80);
+    }
+
+    // Test "extendCommitHash.ts" - should score lower than bin/nom
+    {
+        const needle = Utf32Str{ .ascii = "nom" };
+        const haystack = Utf32Str{ .ascii = "extendCommitHash.ts" };
+
+        var indices: std.ArrayListUnmanaged(u32) = .empty;
+        defer indices.deinit(std.testing.allocator);
+        const score3 = matcher.fuzzyIndices(haystack, needle, &indices);
+
+        try std.testing.expect(score3 != null);
+        // Should be less than bin/nom's ~84
+        try std.testing.expect(score3.? < 84);
+    }
+
+    // Test long path with scattered "nom" matches
+    {
+        const needle = Utf32Str{ .ascii = "nom" };
+        const long_path = Utf32Str{ .ascii = "Library/Application Support/Steam/steamapps/common/Stellaris/gfx/models/ships/megastructures/matter_decompressor/mammalian_01_matter_decompressor_normal.dds" };
+        const short_path = Utf32Str{ .ascii = "bin/nom" };
+
+        const score_long = matcher.fuzzyMatch(long_path, needle);
+        const score_short = matcher.fuzzyMatch(short_path, needle);
+
+        try std.testing.expect(score_short != null);
+        try std.testing.expect(score_long != null);
+        // bin/nom should score HIGHER than the long path
+        // nucleo: long=69, short=84
+        try std.testing.expect(score_short.? > score_long.?);
+    }
 }

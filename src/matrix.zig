@@ -109,7 +109,10 @@ pub fn MatcherDataView(comptime CharType: type) type {
             start: u32,
         ) void {
             const row_off: usize = self.row_offs[0];
-            const next_row_off = if (needle.len > 1) self.row_offs[1] else @as(u16, @intCast(self.haystack.len - 1));
+            // Like nucleo, we need to adjust next_row_off by -1 so that positions
+            // near the next needle char can have their continuations stored properly
+            const raw_next_row_off = if (needle.len > 1) self.row_offs[1] else @as(u16, @intCast(self.haystack.len - 1));
+            const adjusted_next_row_off = if (raw_next_row_off > 0) raw_next_row_off - 1 else raw_next_row_off;
 
             var prefix_bonus: u16 = 0;
             if (config.prefer_prefix) {
@@ -125,9 +128,9 @@ pub fn MatcherDataView(comptime CharType: type) type {
             var prev_p_score: u16 = 0;
             var prev_m_score: u16 = 0;
 
-            // Process columns before next_row_off
+            // Process columns before adjusted_next_row_off (skipped columns that don't need continuation stored)
             var col: usize = row_off;
-            while (col < next_row_off) : (col += 1) {
+            while (col < adjusted_next_row_off) : (col += 1) {
                 const p_result = pScore(prev_p_score, prev_m_score);
                 const p_score_val = p_result.score_val;
                 const p_matched = p_result.matched;
@@ -247,7 +250,7 @@ pub fn MatcherDataView(comptime CharType: type) type {
             var prev_p_score: u16 = 0;
             var prev_m_score: u16 = 0;
 
-            // Process skipped columns
+            // Process skipped columns - only read, don't write to current_row
             var col = row_off;
             while (col < adjusted_next_row_off) : (col += 1) {
                 const rel_col = col - row_off;
@@ -260,14 +263,16 @@ pub fn MatcherDataView(comptime CharType: type) type {
                 prev_m_score = m_cell.score_val;
             }
 
-            // Process remaining columns
+            // Process remaining columns - read from and write to next_relative_row_off positions
+            // This matches nucleo's approach: read cell, then overwrite with new value
             while (col < self.haystack.len) : (col += 1) {
                 const rel_col = col - row_off;
                 const p_result = pScore(prev_p_score, prev_m_score);
 
-                const m_cell = self.current_row[relative_row_off + rel_col];
+                // Read from next_relative_row_off position (like nucleo's score_cell)
+                const m_cell = self.current_row[next_relative_row_off + rel_col];
 
-                // Update current_row for next iteration
+                // Update current_row at the same position for next iteration
                 if (col + 1 < self.haystack.len and
                     charEql(CharType, NeedleCharType, self.haystack[col + 1], next_needle_char))
                 {
@@ -462,7 +467,7 @@ pub const MatrixSlab = struct {
         // Use 2 * haystack_len to be safe for the sliding window approach
         const score_cells_count = haystack_len * 2;
         const score_bytes = score_cells_count * @sizeOf(ScoreCell);
-        // Use a more conservative bound for matrix cells
+        // Use a conservative bound for matrix cells
         // The sparse matrix stores cells for each row from row_off to haystack_len
         // Worst case is haystack_len * needle_len
         const matrix_cells_count = haystack_len * needle_len;
