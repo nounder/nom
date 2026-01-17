@@ -146,8 +146,8 @@ pub const Walker = struct {
         var root_dir = try dir.openDir(".", .{ .iterate = true });
         errdefer root_dir.close();
 
-        // Load gitignore for root
-        try self.ignore_stack.pushDir(root_dir);
+        // Load gitignore for root (path_len = 0)
+        try self.ignore_stack.pushDir(root_dir, 0);
 
         try self.stack.append(self.allocator, .{
             .iter = root_dir.iterateAssumeFirstIteration(),
@@ -180,14 +180,7 @@ pub const Walker = struct {
                 continue;
             };
 
-            // Skip hidden entries if configured
-            if (self.options.ignore_hidden) {
-                if (entry.name.len > 0 and entry.name[0] == '.') {
-                    continue;
-                }
-            }
-
-            // Build relative path
+            // Build relative path (need this first for ignore checks)
             if (self.stack.items[frame_idx].path_len > 0) {
                 try self.path_buf.append(self.allocator, '/');
             }
@@ -197,6 +190,17 @@ pub const Walker = struct {
             const name = self.path_buf.items[name_start..];
 
             const is_dir = entry.kind == .directory;
+
+            // Skip hidden entries if configured, but allow explicitly included ones
+            if (self.options.ignore_hidden) {
+                if (entry.name.len > 0 and entry.name[0] == '.') {
+                    // Check if this hidden entry is explicitly included via negation pattern
+                    if (!self.ignore_stack.isExplicitlyIncluded(name, rel_path, is_dir)) {
+                        continue;
+                    }
+                }
+            }
+
             const depth = self.stack.items[frame_idx].depth;
             const parent_dir = self.stack.items[frame_idx].dir;  // Capture before potential realloc
 
@@ -222,24 +226,28 @@ pub const Walker = struct {
                     _ = self.options.one_file_system;
 
                     // Open and push subdirectory
-                    var subdir = parent_dir.openDir(entry.name, .{ .iterate = true }) catch |err| switch (err) {
+                    // Note: Even if we can't open the dir, we still return it as a result
+                    if (parent_dir.openDir(entry.name, .{ .iterate = true })) |subdir_opened| {
+                        var subdir = subdir_opened;
+                        errdefer subdir.close();
+
+                        const new_path_len = self.path_buf.items.len;
+                        try self.ignore_stack.pushDir(subdir, new_path_len);
+
+                        // This append may reallocate - don't use frame_idx after this
+                        try self.stack.append(self.allocator, .{
+                            .iter = subdir.iterateAssumeFirstIteration(),
+                            .dir = subdir,
+                            .path_len = new_path_len,
+                            .depth = depth + 1,
+                            .owns_dir = true,
+                        });
+                    } else |err| switch (err) {
                         error.AccessDenied, error.PermissionDenied, error.FileNotFound => {
-                            continue;
+                            // Can't descend, but still return the directory entry below
                         },
                         else => return err,
-                    };
-                    errdefer subdir.close();
-
-                    try self.ignore_stack.pushDir(subdir);
-
-                    // This append may reallocate - don't use frame_idx after this
-                    try self.stack.append(self.allocator, .{
-                        .iter = subdir.iterateAssumeFirstIteration(),
-                        .dir = subdir,
-                        .path_len = self.path_buf.items.len,
-                        .depth = depth + 1,
-                        .owns_dir = true,
-                    });
+                    }
                 }
 
                 // Return directory if it passes min_depth

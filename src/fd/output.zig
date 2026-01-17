@@ -25,6 +25,7 @@ pub const OutputFormat = struct {
     /// Format and write an entry to the writer.
     pub fn format(self: OutputFormat, entry: anytype, writer: anytype) !void {
         const path = entry.path;
+        const is_dir = entry.kind == .directory;
 
         if (self.template) |tmpl| {
             try tmpl.apply(path, writer);
@@ -32,8 +33,10 @@ pub const OutputFormat = struct {
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             const abs = try std.fs.cwd().realpath(path, &buf);
             try writer.writeAll(abs);
+            if (is_dir) try writer.writeByte('/');
         } else {
             try writer.writeAll(path);
+            if (is_dir) try writer.writeByte('/');
         }
 
         if (self.null_separator) {
@@ -227,8 +230,9 @@ test "OutputFormat basic" {
 
     const Entry = struct {
         path: []const u8,
+        kind: std.fs.Dir.Entry.Kind,
     };
-    const entry = Entry{ .path = "src/main.zig" };
+    const entry = Entry{ .path = "src/main.zig", .kind = .file };
 
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -238,13 +242,31 @@ test "OutputFormat basic" {
     try std.testing.expectEqualStrings("src/main.zig\n", fbs.getWritten());
 }
 
+test "OutputFormat directory trailing slash" {
+    const fmt = OutputFormat{};
+
+    const Entry = struct {
+        path: []const u8,
+        kind: std.fs.Dir.Entry.Kind,
+    };
+    const entry = Entry{ .path = "src", .kind = .directory };
+
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    try fmt.format(entry, fbs.writer());
+
+    try std.testing.expectEqualStrings("src/\n", fbs.getWritten());
+}
+
 test "OutputFormat null separator" {
     const fmt = OutputFormat{ .null_separator = true };
 
     const Entry = struct {
         path: []const u8,
+        kind: std.fs.Dir.Entry.Kind,
     };
-    const entry = Entry{ .path = "test.txt" };
+    const entry = Entry{ .path = "test.txt", .kind = .file };
 
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);

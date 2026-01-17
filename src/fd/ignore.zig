@@ -138,10 +138,29 @@ pub const Gitignore = struct {
     }
 
     pub fn load(allocator: std.mem.Allocator, dir: std.fs.Dir) !?Gitignore {
-        const content = dir.readFileAlloc(allocator, ".gitignore", 1024 * 1024) catch |err| switch (err) {
+        return loadFile(allocator, dir, ".gitignore");
+    }
+
+    /// Load ignore patterns from a specific file in a directory.
+    pub fn loadFile(allocator: std.mem.Allocator, dir: std.fs.Dir, filename: []const u8) !?Gitignore {
+        const content = dir.readFileAlloc(allocator, filename, 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound, error.AccessDenied, error.PermissionDenied => return null,
             else => return err,
         };
+        return parseContent(allocator, content);
+    }
+
+    /// Load ignore patterns from an absolute path.
+    pub fn loadAbsolute(allocator: std.mem.Allocator, path: []const u8) !?Gitignore {
+        const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied => return null,
+            else => return err,
+        };
+        return parseContent(allocator, content);
+    }
+
+    /// Parse ignore content into a Gitignore struct.
+    fn parseContent(allocator: std.mem.Allocator, content: []u8) !?Gitignore {
         errdefer allocator.free(content);
 
         var patterns: std.ArrayListUnmanaged(GitignorePattern) = .{};
@@ -209,14 +228,25 @@ pub const Gitignore = struct {
 
 /// Options for IgnoreStack.
 pub const IgnoreOptions = struct {
+    /// Respect .gitignore files
     read_gitignore: bool = true,
+    /// Only read .gitignore in git repositories
     require_git: bool = true,
+    /// Respect .fdignore files
+    read_fdignore: bool = true,
+    /// Respect .ignore files
+    read_ignore: bool = true,
+    /// Respect global ~/.fdignore
+    read_global_fdignore: bool = true,
 };
 
 /// A level in the ignore stack.
 const IgnoreLevel = struct {
     gitignore: ?Gitignore,
+    fdignore: ?Gitignore,
+    ignore: ?Gitignore,
     path_len: usize,
+    has_git: bool, // This directory contains .git
 };
 
 /// Stack of gitignore files from root to current directory.
@@ -225,53 +255,86 @@ pub const IgnoreStack = struct {
     allocator: std.mem.Allocator,
     options: IgnoreOptions,
     levels: std.ArrayListUnmanaged(IgnoreLevel),
-    in_git_repo: bool,
+    global_fdignore: ?Gitignore,
 
     pub fn init(allocator: std.mem.Allocator, options: IgnoreOptions) IgnoreStack {
+        // Load global ~/.fdignore
+        var global_fdignore: ?Gitignore = null;
+        if (options.read_global_fdignore) {
+            if (std.posix.getenv("HOME")) |home| {
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const path = std.fmt.bufPrint(&path_buf, "{s}/.fdignore", .{home}) catch null;
+                if (path) |p| {
+                    global_fdignore = Gitignore.loadAbsolute(allocator, p) catch null;
+                }
+            }
+        }
+
         return .{
             .allocator = allocator,
             .options = options,
             .levels = .{},
-            .in_git_repo = false,
+            .global_fdignore = global_fdignore,
         };
     }
 
     pub fn deinit(self: *IgnoreStack) void {
         for (self.levels.items) |level| {
             if (level.gitignore) |gi| gi.deinit(self.allocator);
+            if (level.fdignore) |fi| fi.deinit(self.allocator);
+            if (level.ignore) |ii| ii.deinit(self.allocator);
         }
         self.levels.deinit(self.allocator);
+        if (self.global_fdignore) |gf| gf.deinit(self.allocator);
     }
 
-    /// Push a directory onto the stack, loading its .gitignore if present.
-    pub fn pushDir(self: *IgnoreStack, dir: std.fs.Dir) !void {
-        // Check for .git directory at this level
-        if (!self.in_git_repo) {
-            // .git can be a directory (normal repo) or a file (worktree/submodule)
-            // Use access() which works for both
-            if (dir.access(".git", .{})) |_| {
-                self.in_git_repo = true;
-            } else |_| {
-            }
+    /// Check if we're currently in a git repository subtree.
+    /// A subtree is a git repo if any level from root to current has .git.
+    fn inGitRepo(self: *IgnoreStack) bool {
+        for (self.levels.items) |level| {
+            if (level.has_git) return true;
         }
+        return false;
+    }
+
+    /// Push a directory onto the stack, loading its ignore files if present.
+    /// path_len is the length of the relative path to this directory (0 for root).
+    pub fn pushDir(self: *IgnoreStack, dir: std.fs.Dir, path_len: usize) !void {
+        // Check for .git directory at this level
+        // .git can be a directory (normal repo) or a file (worktree/submodule)
+        // Use access() which works for both
+        const has_git = if (dir.access(".git", .{})) |_| true else |_| false;
 
         var gitignore: ?Gitignore = null;
+        var fdignore: ?Gitignore = null;
+        var dot_ignore: ?Gitignore = null;
 
+        // Load .gitignore (only in git repos if require_git is set)
         if (self.options.read_gitignore) {
-            const should_read = !self.options.require_git or self.in_git_repo;
+            // Check if this subtree is a git repo (current level or any parent has .git)
+            const in_git = has_git or self.inGitRepo();
+            const should_read = !self.options.require_git or in_git;
             if (should_read) {
                 gitignore = try Gitignore.load(self.allocator, dir);
             }
         }
 
-        const path_len = if (self.levels.items.len > 0)
-            self.levels.items[self.levels.items.len - 1].path_len
-        else
-            0;
+        // Load .fdignore (always, if enabled)
+        if (self.options.read_fdignore) {
+            fdignore = try Gitignore.loadFile(self.allocator, dir, ".fdignore");
+        }
+
+        // Load .ignore (always, if enabled)
+        if (self.options.read_ignore) {
+            dot_ignore = try Gitignore.loadFile(self.allocator, dir, ".ignore");
+        }
 
         try self.levels.append(self.allocator, .{
             .gitignore = gitignore,
+            .fdignore = fdignore,
+            .ignore = dot_ignore,
             .path_len = path_len,
+            .has_git = has_git,
         });
     }
 
@@ -280,28 +343,86 @@ pub const IgnoreStack = struct {
         if (self.levels.items.len > 0) {
             if (self.levels.pop()) |level| {
                 if (level.gitignore) |gi| gi.deinit(self.allocator);
+                if (level.fdignore) |fi| fi.deinit(self.allocator);
+                if (level.ignore) |ii| ii.deinit(self.allocator);
             }
         }
     }
 
+    /// Check if a hidden file/dir is explicitly included via negation pattern.
+    /// This allows patterns like `!.claude/` to un-ignore hidden files.
+    pub fn isExplicitlyIncluded(self: *IgnoreStack, name: []const u8, rel_path: []const u8, is_dir: bool) bool {
+        // Check each directory level for negation patterns that match this path
+        for (self.levels.items) |level| {
+            const level_rel = if (level.path_len == 0)
+                rel_path
+            else if (level.path_len < rel_path.len)
+                rel_path[level.path_len + 1 ..]
+            else
+                name;
+
+            // Check each ignore source
+            const sources = [_]?Gitignore{ level.gitignore, level.ignore, level.fdignore };
+            for (sources) |maybe_gi| {
+                if (maybe_gi) |gi| {
+                    // Look for negation patterns that explicitly include this path
+                    for (gi.patterns) |p| {
+                        if (p.is_negation and p.matches(name, level_rel, is_dir)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     /// Check if a path should be ignored.
-    /// Checks all levels from root to current, last match wins.
+    /// Priority (highest wins):
+    /// 1. Global ~/.fdignore (always wins - user's personal preferences)
+    /// 2. Per-level .fdignore
+    /// 3. Per-level .ignore
+    /// 4. Per-level .gitignore
     pub fn isIgnored(self: *IgnoreStack, name: []const u8, rel_path: []const u8, is_dir: bool) bool {
         var result: ?bool = null;
 
+        // Check each directory level (gitignore -> .ignore -> .fdignore)
         for (self.levels.items) |level| {
-            if (level.gitignore) |gi| {
-                // Compute path relative to this gitignore's location
-                const gi_rel = if (level.path_len == 0)
-                    rel_path
-                else if (level.path_len < rel_path.len)
-                    rel_path[level.path_len + 1 ..]
-                else
-                    name;
+            // Compute path relative to this level's location
+            const level_rel = if (level.path_len == 0)
+                rel_path
+            else if (level.path_len < rel_path.len)
+                rel_path[level.path_len + 1 ..]
+            else
+                name;
 
-                if (gi.check(name, gi_rel, is_dir)) |r| {
+            // Check .gitignore
+            if (level.gitignore) |gi| {
+                if (gi.check(name, level_rel, is_dir)) |r| {
                     result = r;
                 }
+            }
+
+            // Check .ignore (overrides .gitignore)
+            if (level.ignore) |ii| {
+                if (ii.check(name, level_rel, is_dir)) |r| {
+                    result = r;
+                }
+            }
+
+            // Check .fdignore (overrides .ignore and .gitignore)
+            if (level.fdignore) |fi| {
+                if (fi.check(name, level_rel, is_dir)) |r| {
+                    result = r;
+                }
+            }
+        }
+
+        // Global ~/.fdignore has highest priority - cannot be overridden by local patterns
+        // This matches fd's behavior where global fdignore represents user preferences
+        if (self.global_fdignore) |gf| {
+            if (gf.check(name, rel_path, is_dir)) |r| {
+                result = r;
             }
         }
 
