@@ -807,14 +807,15 @@ pub const Tui = struct {
     fn moveUp(self: *Tui) void {
         const count = self.getResultCount();
         if (self.config.reverse) {
-            if (self.selected_idx + 1 < count) {
-                self.selected_idx += 1;
+            if (self.selected_idx > 0) {
+                self.selected_idx -= 1;
                 self.ensureVisible();
                 self.needs_redraw = true;
             }
         } else {
-            if (self.selected_idx > 0) {
-                self.selected_idx -= 1;
+            // Index 0 is at bottom, so up means higher index
+            if (self.selected_idx + 1 < count) {
+                self.selected_idx += 1;
                 self.ensureVisible();
                 self.needs_redraw = true;
             }
@@ -824,14 +825,15 @@ pub const Tui = struct {
     fn moveDown(self: *Tui) void {
         const count = self.getResultCount();
         if (self.config.reverse) {
-            if (self.selected_idx > 0) {
-                self.selected_idx -= 1;
+            if (self.selected_idx + 1 < count) {
+                self.selected_idx += 1;
                 self.ensureVisible();
                 self.needs_redraw = true;
             }
         } else {
-            if (self.selected_idx + 1 < count) {
-                self.selected_idx += 1;
+            // Index 0 is at bottom, so down means lower index
+            if (self.selected_idx > 0) {
+                self.selected_idx -= 1;
                 self.ensureVisible();
                 self.needs_redraw = true;
             }
@@ -842,9 +844,10 @@ pub const Tui = struct {
         const count = self.getResultCount();
         const page_size = self.visible_count;
         if (self.config.reverse) {
-            self.selected_idx = @min(self.selected_idx + page_size, count -| 1);
-        } else {
             self.selected_idx -|= page_size;
+        } else {
+            // Index 0 is at bottom, so page up means higher indices
+            self.selected_idx = @min(self.selected_idx + page_size, count -| 1);
         }
         self.ensureVisible();
         self.needs_redraw = true;
@@ -854,9 +857,10 @@ pub const Tui = struct {
         const count = self.getResultCount();
         const page_size = self.visible_count;
         if (self.config.reverse) {
-            self.selected_idx -|= page_size;
-        } else {
             self.selected_idx = @min(self.selected_idx + page_size, count -| 1);
+        } else {
+            // Index 0 is at bottom, so page down means lower indices
+            self.selected_idx -|= page_size;
         }
         self.ensureVisible();
         self.needs_redraw = true;
@@ -1400,7 +1404,7 @@ pub const Tui = struct {
             self.draw_row += 1;
         }
 
-        // Then draw items in reverse order (last item first, so best match is at bottom)
+        // Draw items in reverse: highest index at top, index 0 at bottom (near prompt)
         if (num_items > 0) {
             var i: usize = num_items;
             while (i > 0) {
