@@ -549,7 +549,7 @@ pub fn runFilter(
     std.mem.sort(ScoredItem, scored_items.items, {}, ScoredItem.lessThan);
 
     const stdout = std.fs.File.stdout();
-    var write_buf: [8192]u8 = undefined;
+    var write_buf: [4096]u8 = undefined;
     var file_writer = stdout.writer(&write_buf);
     const writer = &file_writer.interface;
     const output_delimiter: u8 = if (args.print0) 0 else '\n';
