@@ -139,7 +139,7 @@ pub const Gitignore = struct {
 
     pub fn load(allocator: std.mem.Allocator, dir: std.fs.Dir) !?Gitignore {
         const content = dir.readFileAlloc(allocator, ".gitignore", 1024 * 1024) catch |err| switch (err) {
-            error.FileNotFound => return null,
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied => return null,
             else => return err,
         };
         errdefer allocator.free(content);

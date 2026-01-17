@@ -168,7 +168,7 @@ pub const Walker = struct {
             self.path_buf.items.len = self.stack.items[frame_idx].path_len;
 
             const entry = self.stack.items[frame_idx].iter.next() catch |err| switch (err) {
-                error.AccessDenied => continue,
+                error.AccessDenied, error.PermissionDenied => continue,
                 else => return err,
             } orelse {
                 // Directory exhausted, pop frame
@@ -223,7 +223,7 @@ pub const Walker = struct {
 
                     // Open and push subdirectory
                     var subdir = parent_dir.openDir(entry.name, .{ .iterate = true }) catch |err| switch (err) {
-                        error.AccessDenied, error.FileNotFound => {
+                        error.AccessDenied, error.PermissionDenied, error.FileNotFound => {
                             continue;
                         },
                         else => return err,
