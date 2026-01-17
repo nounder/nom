@@ -23,6 +23,8 @@ const ParsedNth = @import("streaming_reader.zig").ParsedNth;
 const TopKHeap = @import("topk.zig").TopKHeap;
 const PreviewRunner = @import("preview.zig").PreviewRunner;
 
+const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
 /// Union type for streaming sources (stdin reader or file walker)
 pub const ChunkSource = union(enum) {
     reader: *StreamingReader,
@@ -245,6 +247,8 @@ pub const Tui = struct {
     needs_search: bool,
     last_search_time: i64, // Throttle rapid searches during streaming
     search_throttle_ms: i64 = 50, // Min time between searches (fzf uses ~50ms)
+    spinner_frame: u8 = 0,
+    last_spinner_time: i64 = 0,
 
     // For inline mode cleanup
     start_row: u16,
@@ -543,6 +547,17 @@ pub const Tui = struct {
 
         self.loading = !source.isDone();
         self.total_loaded = self.chunk_list.total_count;
+
+        // Animate spinner while loading
+        if (self.loading) {
+            const now = std.time.milliTimestamp();
+            if (now - self.last_spinner_time >= 80) {
+                self.spinner_frame = @intCast((self.spinner_frame + 1) % spinner_frames.len);
+                self.last_spinner_time = now;
+                self.needs_redraw = true;
+            }
+        }
+
         if (self.loading != prev_loading) {
             self.needs_redraw = true;
         }
@@ -1189,12 +1204,12 @@ pub const Tui = struct {
                     }
                 }
             } else {
-                // No result yet - show loading indicator
+                // No result yet - show loading indicator with spinner
                 if (row == 0) {
                     try self.term.setDim();
-                    try self.term.write("Loading...");
+                    try self.term.write(spinner_frames[self.spinner_frame]);
                     try self.term.resetStyle();
-                    cols_written = 10;
+                    cols_written = 1;
                 }
             }
 
@@ -1287,7 +1302,7 @@ pub const Tui = struct {
             total_items;
         const result_count = self.getResultCount();
         const info = if (self.loading)
-            std.fmt.bufPrint(&buf, "  Loading... {d}", .{self.total_loaded}) catch ""
+            std.fmt.bufPrint(&buf, "{s} {d}", .{ spinner_frames[self.spinner_frame], self.total_loaded }) catch ""
         else
             std.fmt.bufPrint(&buf, "  {d}/{d}", .{
                 result_count,
