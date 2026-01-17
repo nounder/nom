@@ -5,9 +5,13 @@
 //! - Cursor movement and visibility
 //! - Screen clearing and scrolling
 //! - Color and style output
+//! - Buffered output (all writes accumulated, single atomic flush)
 
 const std = @import("std");
 const posix = std.posix;
+
+/// Size of write buffer - 64KB should be enough for most screens
+const WRITE_BUFFER_SIZE = 64 * 1024;
 
 /// Terminal state for raw mode
 pub const Terminal = struct {
@@ -16,6 +20,10 @@ pub const Terminal = struct {
     original_termios: posix.termios,
     width: u16,
     height: u16,
+
+    // Write buffer for atomic screen updates (like fzf's strings.Builder)
+    write_buf: [WRITE_BUFFER_SIZE]u8 = undefined,
+    write_len: usize = 0,
 
     /// Initialize terminal and enter raw mode
     pub fn init() !Terminal {
@@ -126,19 +134,37 @@ pub const Terminal = struct {
         // Keep defaults (80x24) if all fail
     }
 
-    /// Write bytes to terminal
+    /// Queue bytes to write buffer (does NOT write to terminal yet)
+    /// All writes are accumulated and sent atomically on flush()
     pub fn write(self: *Terminal, bytes: []const u8) !void {
-        _ = try self.ttyout.write(bytes);
+        const available = WRITE_BUFFER_SIZE - self.write_len;
+        const to_write = @min(bytes.len, available);
+        if (to_write > 0) {
+            @memcpy(self.write_buf[self.write_len..][0..to_write], bytes[0..to_write]);
+            self.write_len += to_write;
+        }
+        // If buffer full, flush and continue (shouldn't happen normally)
+        if (to_write < bytes.len) {
+            self.flush();
+            const remaining = bytes[to_write..];
+            const to_write2 = @min(remaining.len, WRITE_BUFFER_SIZE);
+            @memcpy(self.write_buf[0..to_write2], remaining[0..to_write2]);
+            self.write_len = to_write2;
+        }
     }
 
-    /// Flush terminal output (sync to screen)
+    /// Flush buffered output to terminal - atomic screen update
+    /// This is the key to preventing flicker: all CSI codes and text
+    /// are written in a single write() call
     pub fn flush(self: *Terminal) void {
-        // On Unix, we can use fsync or just rely on the terminal
-        // For /dev/tty, writes are typically unbuffered, but we sync anyway
-        _ = posix.system.fsync(self.ttyout.handle);
+        if (self.write_len > 0) {
+            // Single atomic write - prevents flicker
+            _ = self.ttyout.write(self.write_buf[0..self.write_len]) catch {};
+            self.write_len = 0;
+        }
     }
 
-    /// Write formatted output
+    /// Write formatted output to buffer
     pub fn print(self: *Terminal, comptime fmt: []const u8, args: anytype) !void {
         var buf: [4096]u8 = undefined;
         const str = std.fmt.bufPrint(&buf, fmt, args) catch return;
@@ -190,11 +216,17 @@ pub const Terminal = struct {
         if (n > 0) try self.print("\x1b[{d}B", .{n});
     }
 
+    /// Write directly to terminal, bypassing buffer (for queries that need immediate response)
+    fn writeImmediate(self: *Terminal, bytes: []const u8) !void {
+        _ = try self.ttyout.write(bytes);
+    }
+
     /// Query cursor position and return (row, col), both 1-indexed
     pub fn getCursorPos(self: *Terminal) ?struct { row: u16, col: u16 } {
-        // Send cursor position query
-        self.write("\x1b[6n") catch return null;
+        // Flush any pending output first
         self.flush();
+        // Send cursor position query directly (needs immediate response)
+        self.writeImmediate("\x1b[6n") catch return null;
 
         // Read response: ESC [ row ; col R
         var buf: [32]u8 = undefined;
@@ -222,6 +254,21 @@ pub const Terminal = struct {
         const col = std.fmt.parseInt(u16, buf[semi_pos + 1 .. len - 1], 10) catch return null;
 
         return .{ .row = row, .col = col };
+    }
+
+    /// Begin a render frame - hide cursor and disable line wrap
+    pub fn beginFrame(self: *Terminal) !void {
+        try self.write("\x1b[?25l\x1b[?7l"); // Hide cursor, disable line wrap
+    }
+
+    /// End a render frame - restore cursor and line wrap, then flush
+    pub fn endFrame(self: *Terminal, show_cursor: bool) void {
+        if (show_cursor) {
+            self.write("\x1b[?25h\x1b[?7h") catch {}; // Show cursor, enable line wrap
+        } else {
+            self.write("\x1b[?7h") catch {}; // Just enable line wrap
+        }
+        self.flush();
     }
 
     // === Screen Control ===

@@ -606,6 +606,12 @@ pub fn runTui(
         }
     }
 
+    // Parse preview window options
+    const preview_window = if (args.preview_window) |pw_spec|
+        nom.PreviewWindow.parse(pw_spec)
+    else
+        nom.PreviewWindow{};
+
     const tui_config = nom.TuiConfig{
         .prompt = args.prompt,
         .pointer = args.pointer,
@@ -623,6 +629,8 @@ pub fn runTui(
         .delimiter = args.delimiter,
         .nth = args.nth,
         .with_nth = args.with_nth,
+        .preview = args.preview,
+        .preview_window = preview_window,
     };
 
     // Run TUI
@@ -632,12 +640,6 @@ pub fn runTui(
     // Set initial query if provided
     if (args.query) |q| {
         try tui.setQuery(q);
-    }
-
-    // Set preview if configured
-    if (args.preview) |preview_cmd| {
-        const preview_width: u16 = @truncate(tui.term.width / 2);
-        tui.setPreview(preview_cmd, preview_width);
     }
 
     // Run
@@ -692,6 +694,12 @@ pub fn runTuiStreaming(
         }
     }
 
+    // Parse preview window options
+    const preview_window = if (args.preview_window) |pw_spec|
+        nom.PreviewWindow.parse(pw_spec)
+    else
+        nom.PreviewWindow{};
+
     const tui_config = nom.TuiConfig{
         .prompt = args.prompt,
         .pointer = args.pointer,
@@ -709,6 +717,8 @@ pub fn runTuiStreaming(
         .delimiter = args.delimiter,
         .nth = args.nth,
         .with_nth = args.with_nth,
+        .preview = args.preview,
+        .preview_window = preview_window,
     };
 
     var tui = try nom.Tui.init(allocator, &.{}, tui_config, reader);
@@ -716,11 +726,6 @@ pub fn runTuiStreaming(
 
     if (args.query) |q| {
         try tui.setQuery(q);
-    }
-
-    if (args.preview) |preview_cmd| {
-        const preview_width: u16 = @truncate(tui.term.width / 2);
-        tui.setPreview(preview_cmd, preview_width);
     }
 
     var result = try tui.run();

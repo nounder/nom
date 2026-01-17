@@ -20,6 +20,7 @@ const chunk = @import("chunklist.zig");
 const StreamingReader = @import("streaming_reader.zig").StreamingReader;
 const ParsedNth = @import("streaming_reader.zig").ParsedNth;
 const TopKHeap = @import("topk.zig").TopKHeap;
+const PreviewRunner = @import("preview.zig").PreviewRunner;
 
 const nom = @import("root.zig");
 const Matcher = nom.Matcher;
@@ -205,6 +206,11 @@ pub const Tui = struct {
     preview_cmd: ?[]const u8,
     preview_visible: bool,
     preview_width: u16,
+    preview_runner: ?*PreviewRunner,
+    preview_scroll: usize,
+    last_preview_item: ?usize, // Track which item we last requested preview for
+    last_preview_request_time: i64, // For throttling preview requests
+    preview_throttle_ms: i64 = 100, // fzf uses 100ms for preview chunk delay
 
     // Running state
     needs_redraw: bool,
@@ -215,6 +221,7 @@ pub const Tui = struct {
     // For inline mode cleanup
     start_row: u16,
     lines_used: u16,
+    draw_row: u16, // Current row during drawing (reset each frame)
 
     pub fn init(
         allocator: Allocator,
@@ -284,14 +291,19 @@ pub const Tui = struct {
             .selected_idx = 0,
             .visible_count = 0,
             .selections = std.AutoHashMap(usize, void).init(allocator),
-            .preview_cmd = null,
-            .preview_visible = false,
+            .preview_cmd = config.preview,
+            .preview_visible = config.preview != null and !config.preview_window.hidden,
             .preview_width = 0,
+            .preview_runner = null,
+            .preview_scroll = 0,
+            .last_preview_item = null,
+            .last_preview_request_time = 0,
             .needs_redraw = true,
             .needs_search = true,
             .last_search_time = 0,
             .start_row = 1,
             .lines_used = 0,
+            .draw_row = 0,
         };
     }
 
@@ -301,6 +313,12 @@ pub const Tui = struct {
         self.term.resetStyle() catch {};
         self.term.disableMouse() catch {};
         self.term.deinit();
+
+        // Stop preview runner
+        if (self.preview_runner) |runner| {
+            runner.deinit();
+            self.allocator.destroy(runner);
+        }
 
         // Free resources
         for (self.matched_items.items) |item| {
@@ -367,6 +385,14 @@ pub const Tui = struct {
             try self.term.enableMouse();
         }
 
+        // Initialize preview runner if preview is configured
+        if (self.preview_cmd != null) {
+            const runner = try self.allocator.create(PreviewRunner);
+            runner.* = PreviewRunner.init(self.allocator);
+            try runner.start();
+            self.preview_runner = runner;
+        }
+
         // Start in "loading" mode when streaming; initial draw happens before any search.
         self.loading = if (self.stream_reader) |r| !r.isDone() else false;
         self.total_loaded = self.chunk_list.total_count;
@@ -383,6 +409,16 @@ pub const Tui = struct {
                 self.updateLastSearchTime();
                 self.needs_search = false;
                 self.needs_redraw = true;
+            }
+
+            // Request preview for current selection if it changed
+            self.updatePreview();
+
+            // Poll for preview results
+            if (self.preview_runner) |runner| {
+                if (runner.poll() != null) {
+                    self.needs_redraw = true;
+                }
             }
 
             if (self.needs_redraw) {
@@ -414,6 +450,58 @@ pub const Tui = struct {
                 },
             }
         }
+    }
+
+    /// Request preview for the currently selected item if it changed
+    fn updatePreview(self: *Tui) void {
+        const runner = self.preview_runner orelse return;
+        const cmd = self.preview_cmd orelse return;
+        if (!self.preview_visible) return;
+
+        const count = self.getResultCount();
+        if (count == 0) {
+            // No items - cancel any pending preview
+            if (self.last_preview_item != null) {
+                runner.cancel();
+                self.last_preview_item = null;
+            }
+            return;
+        }
+
+        // Get current item ID
+        const current_id = if (self.showing_all)
+            self.items.items[self.selected_idx].id
+        else
+            self.matched_items.items[self.selected_idx].item.id;
+
+        // Only request if selection changed
+        if (self.last_preview_item == current_id) return;
+
+        // Throttle preview requests (like fzf's previewChunkDelay)
+        const now = std.time.milliTimestamp();
+        if (now - self.last_preview_request_time < self.preview_throttle_ms) {
+            // Not enough time passed - will be picked up on next update
+            return;
+        }
+
+        self.last_preview_item = current_id;
+        self.last_preview_request_time = now;
+
+        // Get the item text for the preview command
+        const item_text = if (self.showing_all)
+            self.items.items[self.selected_idx].original
+        else
+            self.matched_items.items[self.selected_idx].item.original;
+
+        // Request preview
+        runner.request(.{
+            .command = cmd,
+            .item = item_text,
+            .query = self.query.items,
+        });
+
+        // Reset preview scroll when item changes
+        self.preview_scroll = 0;
     }
 
     fn pollStream(self: *Tui) !void {
@@ -931,6 +1019,9 @@ pub const Tui = struct {
     fn draw(self: *Tui) !void {
         self.term.updateSize();
 
+        // Begin frame - hide cursor and disable line wrap during render
+        try self.term.beginFrame();
+
         // Calculate layout
         const header_height: u16 = @truncate(self.header_items.items.len);
         const prompt_height: u16 = 1;
@@ -949,6 +1040,38 @@ pub const Tui = struct {
             break :blk max_height;
         };
 
+        // Calculate preview layout
+        var list_width = self.term.width;
+        var preview_col: u16 = 0;
+        var preview_width_actual: u16 = 0;
+        var list_col: u16 = 1;
+
+        if (self.preview_visible and self.preview_cmd != null) {
+            const pw = self.config.preview_window;
+            const size_pct = @min(pw.size, 80); // Cap at 80%
+            preview_width_actual = @max(10, self.term.width * size_pct / 100);
+
+            switch (pw.position) {
+                .right => {
+                    list_width = self.term.width -| preview_width_actual -| 1; // 1 for border
+                    preview_col = list_width + 2;
+                    list_col = 1;
+                },
+                .left => {
+                    list_width = self.term.width -| preview_width_actual -| 1;
+                    preview_col = 1;
+                    list_col = preview_width_actual + 2;
+                },
+                .up, .down => {
+                    // Vertical split - for now treat as right
+                    list_width = self.term.width -| preview_width_actual -| 1;
+                    preview_col = list_width + 2;
+                    list_col = 1;
+                },
+            }
+        }
+        self.preview_width = preview_width_actual;
+
         self.visible_count = if (available_height > reserved)
             available_height - reserved
         else
@@ -957,47 +1080,170 @@ pub const Tui = struct {
         // Track total lines we use
         self.lines_used = reserved + @as(u16, @truncate(self.visible_count));
 
-        // Start drawing from our start row
-        try self.term.moveTo(self.start_row, 1);
-        try self.term.clearToEnd();
+        // Reset draw row counter for this frame
+        self.draw_row = 0;
 
+        // Draw main list area
         if (self.config.reverse) {
             // Prompt at top
-            try self.drawPromptLine();
-            try self.drawInfoLine();
-            try self.drawList();
-            try self.drawHeader();
+            try self.drawPromptLine(list_width, list_col);
+            try self.drawInfoLine(list_width, list_col);
+            try self.drawList(list_width, list_col);
+            try self.drawHeader(list_width, list_col);
         } else {
             // Prompt at bottom (fzf default style)
-            // Draw from bottom up: list items from top, then info, then prompt at bottom
-            try self.drawHeader();
-            try self.drawListBottomUp();
-            try self.drawInfoLine();
-            try self.drawPromptLine();
+            try self.drawHeader(list_width, list_col);
+            try self.drawListBottomUp(list_width, list_col);
+            try self.drawInfoLine(list_width, list_col);
+            try self.drawPromptLine(list_width, list_col);
         }
 
-        // Position cursor in prompt
+        // Draw preview window if visible
+        if (self.preview_visible and preview_width_actual > 0) {
+            try self.drawPreview(preview_col, preview_width_actual);
+        }
+
+        // Position cursor at end of prompt input
         const prompt_row: u16 = if (self.config.reverse)
             self.start_row
         else
             self.start_row + self.lines_used - 1;
-        const prompt_col: u16 = @truncate(self.config.prompt.len + self.cursor_pos + 1);
-        try self.term.moveTo(prompt_row, prompt_col);
-        try self.term.showCursor();
+        const prompt_col_pos: u16 = list_col + @as(u16, @truncate(self.config.prompt.len + self.cursor_pos));
+        try self.term.moveTo(prompt_row, prompt_col_pos);
 
-        // Flush output to screen
-        self.term.flush();
+        // End frame - show cursor and flush all buffered output atomically
+        self.term.endFrame(true);
     }
 
-    fn drawPromptLine(self: *Tui) !void {
+    fn drawPreview(self: *Tui, col: u16, width: u16) !void {
+        const runner = self.preview_runner orelse return;
+        const result = runner.poll();
+
+        const border_char = if (self.config.preview_window.border) "│" else "";
+        const border_width: u16 = if (self.config.preview_window.border) 1 else 0;
+        const content_width = width -| border_width;
+
+        // Draw preview content line by line
+        var row: u16 = 0;
+        while (row < self.visible_count + 3) : (row += 1) { // +3 for header/info/prompt area
+            try self.term.moveTo(self.start_row + row, col);
+
+            // Draw border
+            if (self.config.preview_window.border) {
+                try self.term.setDim();
+                try self.term.write(border_char);
+                try self.term.resetStyle();
+            }
+
+            // Track how many columns we've written
+            var cols_written: u16 = 0;
+
+            // Draw content
+            if (result) |r| {
+                if (r.error_msg) |err| {
+                    if (row == 0) {
+                        try self.term.setFg(Color.red);
+                        try self.term.write("Error: ");
+                        const max_len = @min(err.len, content_width -| 7);
+                        try self.term.write(err[0..max_len]);
+                        try self.term.resetStyle();
+                        cols_written = 7 + @as(u16, @truncate(max_len));
+                    }
+                } else {
+                    const line_idx = self.preview_scroll + row;
+                    if (line_idx < r.lines.len) {
+                        const line = r.lines[line_idx];
+                        cols_written = try self.drawPreviewLine(line, content_width);
+                    }
+                }
+            } else {
+                // No result yet - show loading indicator
+                if (row == 0) {
+                    try self.term.setDim();
+                    try self.term.write("Loading...");
+                    try self.term.resetStyle();
+                    cols_written = 10;
+                }
+            }
+
+            // Clear rest of line with spaces
+            if (cols_written < content_width) {
+                var spaces: [256]u8 = undefined;
+                const space_count = @min(content_width - cols_written, 256);
+                @memset(spaces[0..space_count], ' ');
+                try self.term.resetStyle();
+                try self.term.write(spaces[0..space_count]);
+            }
+        }
+    }
+
+    fn drawPreviewLine(self: *Tui, line: []const u8, max_width: u16) !u16 {
+        var col: u16 = 0;
+
+        if (self.config.preview_window.wrap) {
+            // Wrapping mode - just output up to width, more complex wrapping would need state
+            const display_len = @min(line.len, max_width);
+            try self.term.write(line[0..display_len]);
+            col = @truncate(display_len);
+        } else {
+            // No wrap - truncate
+            var i: usize = 0;
+
+            while (i < line.len and col < max_width) {
+                const byte = line[i];
+
+                // Handle ANSI escape sequences (pass through)
+                if (byte == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
+                    // Find end of escape sequence
+                    var j = i + 2;
+                    while (j < line.len) : (j += 1) {
+                        const c = line[j];
+                        if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    try self.term.write(line[i..j]);
+                    i = j;
+                    continue;
+                }
+
+                // Regular character
+                try self.term.write(line[i .. i + 1]);
+                col += 1;
+                i += 1;
+            }
+        }
+        return col;
+    }
+
+    fn drawPromptLine(self: *Tui, max_width: u16, col: u16) !void {
+        try self.term.moveTo(self.start_row + self.draw_row, col);
         try self.term.resetStyle();
         try self.term.write(self.config.prompt);
-        try self.term.write(self.query.items);
-        try self.term.clearLineToEnd();
-        // No \r\n - cursor will be positioned explicitly
+
+        // Truncate query if needed
+        const prompt_len = self.config.prompt.len;
+        const available = max_width -| @as(u16, @truncate(prompt_len));
+        const query_display = if (self.query.items.len > available)
+            self.query.items[0..available]
+        else
+            self.query.items;
+        try self.term.write(query_display);
+
+        // Clear rest of line (only within our width)
+        const used = prompt_len + query_display.len;
+        if (used < max_width) {
+            var spaces: [256]u8 = undefined;
+            const count = @min(max_width - @as(u16, @truncate(used)), 256);
+            @memset(spaces[0..count], ' ');
+            try self.term.write(spaces[0..count]);
+        }
+        self.draw_row += 1;
     }
 
-    fn drawInfoLine(self: *Tui) !void {
+    fn drawInfoLine(self: *Tui, max_width: u16, col: u16) !void {
+        try self.term.moveTo(self.start_row + self.draw_row, col);
         try self.term.resetStyle();
         try self.term.setDim();
 
@@ -1016,71 +1262,100 @@ pub const Tui = struct {
                 total_display,
             }) catch "";
 
+        try self.term.write(info);
+
         if (self.config.multi and self.selections.count() > 0) {
             var buf2: [32]u8 = undefined;
             const selected_info = std.fmt.bufPrint(&buf2, " ({d})", .{self.selections.count()}) catch "";
-            try self.term.write(info);
             try self.term.write(selected_info);
-        } else {
-            try self.term.write(info);
         }
 
-        try self.term.clearLineToEnd();
+        // Clear rest of line
+        var spaces: [256]u8 = undefined;
+        const used: u16 = @truncate(info.len);
+        if (used < max_width) {
+            const count = @min(max_width - used, 256);
+            @memset(spaces[0..count], ' ');
+            try self.term.write(spaces[0..count]);
+        }
         try self.term.resetStyle();
-        try self.term.write("\r\n");
+        self.draw_row += 1;
     }
 
-    fn drawHeader(self: *Tui) !void {
+    fn drawHeader(self: *Tui, max_width: u16, col: u16) !void {
         // Custom header
         if (self.config.header) |h| {
+            try self.term.moveTo(self.start_row + self.draw_row, col);
             try self.term.resetStyle();
             try self.term.setDim();
             try self.term.write("  ");
-            try self.term.write(h);
-            try self.term.clearLineToEnd();
+            const header_max = max_width -| 2;
+            const display_h = if (h.len > header_max) h[0..header_max] else h;
+            try self.term.write(display_h);
+
+            // Clear rest of line
+            var spaces: [256]u8 = undefined;
+            const used: u16 = 2 + @as(u16, @truncate(display_h.len));
+            if (used < max_width) {
+                const count = @min(max_width - used, 256);
+                @memset(spaces[0..count], ' ');
+                try self.term.write(spaces[0..count]);
+            }
             try self.term.resetStyle();
-            try self.term.write("\r\n");
+            self.draw_row += 1;
         }
 
         // Header lines from input
         for (self.header_items.items) |item_ptr| {
+            try self.term.moveTo(self.start_row + self.draw_row, col);
             try self.term.resetStyle();
             try self.term.setDim();
             try self.term.write("  ");
-            const max_width = self.term.width -| 2;
+            const item_max = max_width -| 2;
             const line = item_ptr.display;
-            const display_text = if (line.len > max_width) line[0..max_width] else line;
+            const display_text = if (line.len > item_max) line[0..item_max] else line;
             try self.term.write(display_text);
-            try self.term.clearLineToEnd();
+
+            // Clear rest of line
+            var spaces: [256]u8 = undefined;
+            const used: u16 = 2 + @as(u16, @truncate(display_text.len));
+            if (used < max_width) {
+                const count = @min(max_width - used, 256);
+                @memset(spaces[0..count], ' ');
+                try self.term.write(spaces[0..count]);
+            }
             try self.term.resetStyle();
-            try self.term.write("\r\n");
+            self.draw_row += 1;
         }
     }
 
-    fn drawList(self: *Tui) !void {
+    fn drawList(self: *Tui, max_width: u16, col: u16) !void {
         const count = self.getResultCount();
         const end_idx = @min(self.scroll_offset + self.visible_count, count);
 
-        var row: usize = 0;
         var idx = self.scroll_offset;
         while (idx < end_idx) : (idx += 1) {
             const item = self.getDisplayItem(idx);
             const is_current = idx == self.selected_idx;
-
-            try self.drawDisplayItem(item, is_current);
-            row += 1;
+            try self.drawDisplayItem(item, is_current, max_width, col);
         }
 
-        // Fill remaining rows
-        while (row < self.visible_count) : (row += 1) {
+        // Fill remaining rows with empty lines
+        const drawn = end_idx - self.scroll_offset;
+        var remaining = self.visible_count - drawn;
+        while (remaining > 0) : (remaining -= 1) {
+            try self.term.moveTo(self.start_row + self.draw_row, col);
             try self.term.resetStyle();
-            try self.term.clearLine();
-            try self.term.write("\r\n");
+            var spaces: [256]u8 = undefined;
+            const count_spaces = @min(max_width, 256);
+            @memset(spaces[0..count_spaces], ' ');
+            try self.term.write(spaces[0..count_spaces]);
+            self.draw_row += 1;
         }
     }
 
     /// Draw list in fzf-style: best match at bottom, near the prompt
-    fn drawListBottomUp(self: *Tui) !void {
+    fn drawListBottomUp(self: *Tui, max_width: u16, col: u16) !void {
         const count = self.getResultCount();
         const end_idx = @min(self.scroll_offset + self.visible_count, count);
         const num_items = end_idx - self.scroll_offset;
@@ -1088,9 +1363,13 @@ pub const Tui = struct {
         // First, fill empty rows at top
         var empty_rows = self.visible_count - num_items;
         while (empty_rows > 0) : (empty_rows -= 1) {
+            try self.term.moveTo(self.start_row + self.draw_row, col);
             try self.term.resetStyle();
-            try self.term.clearLine();
-            try self.term.write("\r\n");
+            var spaces: [256]u8 = undefined;
+            const count_spaces = @min(max_width, 256);
+            @memset(spaces[0..count_spaces], ' ');
+            try self.term.write(spaces[0..count_spaces]);
+            self.draw_row += 1;
         }
 
         // Then draw items in reverse order (last item first, so best match is at bottom)
@@ -1101,12 +1380,13 @@ pub const Tui = struct {
                 const idx = self.scroll_offset + i;
                 const item = self.getDisplayItem(idx);
                 const is_current = idx == self.selected_idx;
-                try self.drawDisplayItem(item, is_current);
+                try self.drawDisplayItem(item, is_current, max_width, col);
             }
         }
     }
 
-    fn drawDisplayItem(self: *Tui, item: DisplayItem, is_current: bool) !void {
+    fn drawDisplayItem(self: *Tui, item: DisplayItem, is_current: bool, max_width: u16, col: u16) !void {
+        try self.term.moveTo(self.start_row + self.draw_row, col);
         try self.term.resetStyle();
 
         // Pointer/marker
@@ -1123,16 +1403,23 @@ pub const Tui = struct {
 
         try self.term.write(" ");
 
-        // Text with highlighting
-        const max_width = self.term.width -| 3;
-        try self.drawHighlightedText(item.display, item.indices, max_width, is_current);
+        // Text with highlighting (reserve 3 chars for pointer + space)
+        const text_width = max_width -| 3;
+        const chars_written = try self.drawHighlightedText(item.display, item.indices, text_width, is_current);
 
-        try self.term.clearLineToEnd();
-        try self.term.resetStyle();
-        try self.term.write("\r\n");
+        // Clear rest of line with spaces (don't use clearLineToEnd with preview)
+        const total_used: u16 = 2 + chars_written; // pointer + space + text
+        if (total_used < max_width) {
+            var spaces: [256]u8 = undefined;
+            const space_count = @min(max_width - total_used, 256);
+            @memset(spaces[0..space_count], ' ');
+            try self.term.resetStyle();
+            try self.term.write(spaces[0..space_count]);
+        }
+        self.draw_row += 1;
     }
 
-    fn drawHighlightedText(self: *Tui, text: []const u8, indices: []const u32, max_width: u16, is_current: bool) !void {
+    fn drawHighlightedText(self: *Tui, text: []const u8, indices: []const u32, max_width: u16, is_current: bool) !u16 {
         var col: u16 = 0;
         var idx_pos: usize = 0;
         var byte_pos: usize = 0;
@@ -1177,7 +1464,9 @@ pub const Tui = struct {
             try self.term.resetStyle();
             try self.term.setDim();
             try self.term.write("…");
+            col += 1;
         }
+        return col;
     }
 
     fn clearDisplay(self: *Tui) !void {
@@ -1193,6 +1482,8 @@ pub const Tui = struct {
             try self.term.clearToEnd(); // Clear from cursor to end of screen
             try self.term.showCursor();
         }
+        // Flush to actually send the clear commands to the terminal
+        self.term.flush();
     }
 
     /// Calculate how many lines the TUI needs

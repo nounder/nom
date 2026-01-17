@@ -48,7 +48,12 @@ pub const Normalization = @import("pattern.zig").Normalization;
 pub const Tui = @import("tui.zig").Tui;
 pub const TuiConfig = @import("tui.zig").TuiConfig;
 pub const TuiResult = @import("tui.zig").TuiResult;
+pub const PreviewWindow = @import("tui.zig").PreviewWindow;
 pub const Terminal = @import("term.zig").Terminal;
+
+// Preview
+pub const preview = @import("preview.zig");
+pub const PreviewRunner = preview.PreviewRunner;
 
 // fzf compatibility
 pub const fzf = @import("fzf.zig");
