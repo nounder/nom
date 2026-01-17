@@ -8,14 +8,23 @@
 //! - Long options: `--query=value` or `--query value`
 
 const std = @import("std");
-const nom = @import("root.zig");
 const files = @import("files.zig");
 const StreamingReader = @import("streaming_reader.zig").StreamingReader;
 const StreamingWalker = files.StreamingWalker;
-const ChunkSource = nom.ChunkSource;
+const tui_mod = @import("tui.zig");
+const pattern_mod = @import("pattern.zig");
+const matcher_mod = @import("matcher.zig");
+const utf32_str = @import("utf32_str.zig");
 
-const CaseMatching = nom.CaseMatching;
-const Normalization = nom.Normalization;
+const Tui = tui_mod.Tui;
+const TuiConfig = tui_mod.TuiConfig;
+const ChunkSource = tui_mod.ChunkSource;
+const PreviewWindow = tui_mod.PreviewWindow;
+const Pattern = pattern_mod.Pattern;
+const CaseMatching = pattern_mod.CaseMatching;
+const Normalization = pattern_mod.Normalization;
+const Matcher = matcher_mod.Matcher;
+const Utf32Str = utf32_str.Utf32Str;
 
 /// CLI arguments compatible with fzf
 pub const Args = struct {
@@ -145,11 +154,17 @@ pub const Args = struct {
 
     /// Parse command line arguments
     pub fn parse(allocator: std.mem.Allocator) ParseError!ParseResult {
-        var args = Args{};
         const argv = std.process.argsAlloc(allocator) catch return error.OutOfMemory;
         errdefer std.process.argsFree(allocator, argv);
+        const args = try parseFromSlice(argv[1..]); // Skip program name
+        return .{ .args = args, .argv = argv, .allocator = allocator };
+    }
 
-        var i: usize = 1; // Skip program name
+    /// Parse from a slice of arguments (does not include program name)
+    pub fn parseFromSlice(argv: []const [:0]const u8) ParseError!Args {
+        var args = Args{};
+
+        var i: usize = 0;
         while (i < argv.len) : (i += 1) {
             const arg = argv[i];
 
@@ -167,7 +182,7 @@ pub const Args = struct {
                 continue;
             }
 
-            if (parseArg(&args, arg, argv, &i)) continue;
+            if (parseArgSlice(&args, arg, argv, &i)) continue;
 
             // Check for unknown options (anything starting with - or +)
             if (arg.len > 0 and (arg[0] == '-' or arg[0] == '+')) {
@@ -178,7 +193,7 @@ pub const Args = struct {
             // Non-option arguments are ignored (positional args)
         }
 
-        return .{ .args = args, .argv = argv, .allocator = allocator };
+        return args;
     }
 
     /// Print unknown option error to stderr
@@ -188,8 +203,8 @@ pub const Args = struct {
         std.fs.File.stderr().writeAll("\n") catch {};
     }
 
-    /// Parse a single argument, returns true if handled
-    fn parseArg(args: *Args, arg: []const u8, argv: [][:0]u8, i: *usize) bool {
+    /// Parse a single argument, returns true if handled (generic over argv type)
+    fn parseArgSlice(args: *Args, arg: []const u8, argv: anytype, i: *usize) bool {
         inline for (@typeInfo(@TypeOf(meta)).@"struct".fields) |field| {
             const opt = @field(meta, field.name);
 
@@ -225,7 +240,7 @@ pub const Args = struct {
 
             // Handle value options
             if (@hasField(@TypeOf(opt), "takes_value") and opt.takes_value) {
-                if (parseValueOpt(args, field.name, opt, arg, argv, i)) {
+                if (parseValueOptSlice(args, field.name, opt, arg, argv, i)) {
                     return true;
                 }
             }
@@ -233,13 +248,13 @@ pub const Args = struct {
         return false;
     }
 
-    /// Parse an option that takes a value
-    fn parseValueOpt(
+    /// Parse an option that takes a value (generic over argv type)
+    fn parseValueOptSlice(
         args: *Args,
         comptime field_name: []const u8,
         comptime opt: anytype,
         arg: []const u8,
-        argv: [][:0]u8,
+        argv: anytype,
         i: *usize,
     ) bool {
         const FieldType = @TypeOf(@field(args.*, field_name));
@@ -506,7 +521,7 @@ pub fn runFilter(
     args: *const Args,
     input: []const u8,
 ) !void {
-    var matcher = try nom.Matcher.initDefault(allocator);
+    var matcher = try Matcher.initDefault(allocator);
     defer matcher.deinit();
 
     // Configure case sensitivity
@@ -527,7 +542,7 @@ pub fn runFilter(
 
     const normalization: Normalization = .smart;
 
-    var pattern = try nom.Pattern.parse(allocator, filter_query, case_mode, normalization);
+    var pattern = try Pattern.parse(allocator, filter_query, case_mode, normalization);
     defer pattern.deinit();
 
     var buf: std.ArrayListUnmanaged(u21) = .empty;
@@ -559,7 +574,7 @@ pub fn runFilter(
             break :blk extracted;
         } else line;
 
-        const haystack = nom.Utf32Str.init(match_text, allocator, &buf);
+        const haystack = Utf32Str.init(match_text, allocator, &buf);
         if (pattern.score(haystack, &matcher)) |s| {
             // Always output the original line, not the extracted fields
             try scored_items.append(allocator, .{ .line = line, .score = s });
@@ -629,11 +644,11 @@ pub fn runTui(
 
     // Parse preview window options
     const preview_window = if (args.preview_window) |pw_spec|
-        nom.PreviewWindow.parse(pw_spec)
+        PreviewWindow.parse(pw_spec)
     else
-        nom.PreviewWindow{};
+        PreviewWindow{};
 
-    const tui_config = nom.TuiConfig{
+    const tui_config = TuiConfig{
         .prompt = args.prompt,
         .pointer = args.pointer,
         .marker = args.marker,
@@ -655,7 +670,7 @@ pub fn runTui(
     };
 
     // Run TUI
-    var tui = try nom.Tui.init(allocator, lines.items, tui_config, null);
+    var tui = try Tui.init(allocator, lines.items, tui_config, null);
     defer tui.deinit();
 
     // Set initial query if provided
@@ -717,11 +732,11 @@ pub fn runTuiStreaming(
 
     // Parse preview window options
     const preview_window = if (args.preview_window) |pw_spec|
-        nom.PreviewWindow.parse(pw_spec)
+        PreviewWindow.parse(pw_spec)
     else
-        nom.PreviewWindow{};
+        PreviewWindow{};
 
-    const tui_config = nom.TuiConfig{
+    const tui_config = TuiConfig{
         .prompt = args.prompt,
         .pointer = args.pointer,
         .marker = args.marker,
@@ -742,7 +757,7 @@ pub fn runTuiStreaming(
         .preview_window = preview_window,
     };
 
-    var tui = try nom.Tui.init(allocator, &.{}, tui_config, ChunkSource{ .reader = reader });
+    var tui = try Tui.init(allocator, &.{}, tui_config, ChunkSource{ .reader = reader });
     defer tui.deinit();
 
     if (args.query) |q| {
@@ -802,11 +817,11 @@ pub fn runTuiWithWalker(
 
     // Parse preview window options
     const preview_window = if (args.preview_window) |pw_spec|
-        nom.PreviewWindow.parse(pw_spec)
+        PreviewWindow.parse(pw_spec)
     else
-        nom.PreviewWindow{};
+        PreviewWindow{};
 
-    const tui_config = nom.TuiConfig{
+    const tui_config = TuiConfig{
         .prompt = args.prompt,
         .pointer = args.pointer,
         .marker = args.marker,
@@ -827,7 +842,7 @@ pub fn runTuiWithWalker(
         .preview_window = preview_window,
     };
 
-    var tui = try nom.Tui.init(allocator, &.{}, tui_config, ChunkSource{ .walker = walker });
+    var tui = try Tui.init(allocator, &.{}, tui_config, ChunkSource{ .walker = walker });
     defer tui.deinit();
 
     if (args.query) |q| {
