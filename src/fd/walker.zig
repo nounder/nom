@@ -150,12 +150,7 @@ pub const Walker = struct {
         self.ignore_stack.deinit();
     }
 
-    pub fn start(self: *Walker) !void {
-        try self.startAt(std.fs.cwd(), ".");
-    }
-
-    pub fn startAt(self: *Walker, dir: std.fs.Dir, path: []const u8) !void {
-        _ = path;
+    pub fn start(self: *Walker, dir: std.fs.Dir) !void {
         if (self.started) return error.AlreadyStarted;
         self.started = true;
 

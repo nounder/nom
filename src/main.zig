@@ -100,7 +100,7 @@ fn runFzf(allocator: std.mem.Allocator, args: fzf.Args) !void {
             break :blk fzf.runTui(allocator, &args, input);
         } else {
             // Use streaming file walker for built-in directory walking
-            var walker = StreamingWalker.init(allocator);
+            var walker = StreamingWalker.init(allocator, std.fs.cwd());
             defer walker.deinit();
             try walker.start();
             break :blk fzf.runTuiWithWalker(allocator, &args, &walker);

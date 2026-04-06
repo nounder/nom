@@ -346,17 +346,17 @@ pub const RecursiveWalker = struct {
     }
 };
 
-/// Walk the current directory and collect all file paths into a newline-separated buffer.
+/// Walk a directory and collect all file paths into a newline-separated buffer.
 /// Behaves like fd: skips hidden files and respects .gitignore.
-pub fn walk(allocator: std.mem.Allocator) ![]const u8 {
+pub fn walk(allocator: std.mem.Allocator, dir: std.fs.Dir) ![]const u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
 
-    const dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
+    const root = try dir.openDir(".", .{ .iterate = true });
 
     var walker = RecursiveWalker.init(allocator);
     defer walker.deinit();
-    try walker.start(dir);
+    try walker.start(root);
 
     while (try walker.next()) |entry| {
         try result.appendSlice(allocator, entry.path);
@@ -368,7 +368,7 @@ pub fn walk(allocator: std.mem.Allocator) ![]const u8 {
 
 test "walk" {
     const allocator = std.testing.allocator;
-    const result = try walk(allocator);
+    const result = try walk(allocator, std.fs.cwd());
     defer allocator.free(result);
     try std.testing.expect(result.len > 0);
 }
@@ -440,6 +440,7 @@ pub const StreamingWalker = struct {
     const CHUNK_SIZE: usize = 100;
 
     allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
     thread: ?std.Thread = null,
     mutex: std.Thread.Mutex = .{},
     condition: std.Thread.Condition = .{},
@@ -449,9 +450,10 @@ pub const StreamingWalker = struct {
     error_state: ?anyerror = null,
     next_id: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator) StreamingWalker {
+    pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir) StreamingWalker {
         return .{
             .allocator = allocator,
+            .dir = dir,
             .queue = .{},
         };
     }
@@ -525,7 +527,7 @@ pub const StreamingWalker = struct {
     }
 
     fn walkLoop(self: *StreamingWalker) !void {
-        const dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
+        const dir = try self.dir.openDir(".", .{ .iterate = true });
 
         var walker = RecursiveWalker.init(self.allocator);
         defer walker.deinit();

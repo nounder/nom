@@ -135,16 +135,11 @@ pub const Finder = struct {
         self.inner_walker.deinit();
     }
 
-    /// Start the finder from the current working directory.
-    pub fn start(self: *Finder) !void {
-        try self.startAt(std.fs.cwd());
-    }
-
     /// Start the finder from a specific directory.
-    pub fn startAt(self: *Finder, dir: std.fs.Dir) !void {
+    pub fn start(self: *Finder, dir: std.fs.Dir) !void {
         if (self.started) return error.AlreadyStarted;
         self.started = true;
-        try self.inner_walker.startAt(dir, ".");
+        try self.inner_walker.start(dir);
     }
 
     /// Get the next matching entry.
@@ -198,12 +193,13 @@ pub fn hasUppercase(s: []const u8) bool {
 /// Useful for simple one-off searches.
 pub fn find(
     allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
     options: FinderOptions,
     callback: fn (Entry) anyerror!bool, // Return false to stop
 ) !usize {
     var finder = try Finder.init(allocator, options);
     defer finder.deinit();
-    try finder.start();
+    try finder.start(dir);
 
     var count: usize = 0;
     while (try finder.next()) |entry| {

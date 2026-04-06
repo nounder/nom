@@ -457,12 +457,12 @@ pub fn run(allocator: std.mem.Allocator, arg_iter: anytype) !void {
         defer search_dir.close();
 
         // Start finder at this path
-        finder.startAt(search_dir) catch |err| switch (err) {
+        finder.start(search_dir) catch |err| switch (err) {
             error.AlreadyStarted => {
                 // Re-initialize finder for next path
                 finder.deinit();
                 finder = try fd.Finder.init(allocator, finder_opts);
-                try finder.startAt(search_dir);
+                try finder.start(search_dir);
             },
             else => return err,
         };

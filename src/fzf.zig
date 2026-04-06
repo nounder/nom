@@ -884,7 +884,7 @@ pub fn getDefaultSource(allocator: std.mem.Allocator) ![]const u8 {
     if (std.posix.getenv("FZF_DEFAULT_COMMAND")) |cmd| {
         return try runShellCommand(allocator, cmd);
     }
-    return try files.walk(allocator);
+    return try files.walk(allocator, std.fs.cwd());
 }
 
 /// Run a shell command and return its stdout
