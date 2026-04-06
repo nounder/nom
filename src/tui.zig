@@ -346,6 +346,7 @@ pub const Tui = struct {
         self.term.showCursor() catch {};
         self.term.resetStyle() catch {};
         self.term.disableMouse() catch {};
+        self.term.flush();
         self.term.deinit();
 
         // Stop preview runner

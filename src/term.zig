@@ -72,6 +72,7 @@ pub const Terminal = struct {
 
     /// Clean up and restore terminal
     pub fn deinit(self: *Terminal) void {
+        self.flush();
         self.disableRawMode() catch {};
         self.ttyin.close();
         // Only close ttyout if it's not stderr
