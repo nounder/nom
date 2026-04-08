@@ -18,6 +18,7 @@ const utf32_str = @import("utf32_str.zig");
 
 const Tui = tui_mod.Tui;
 const TuiConfig = tui_mod.TuiConfig;
+const TuiResult = tui_mod.TuiResult;
 const ChunkSource = tui_mod.ChunkSource;
 const PreviewWindow = tui_mod.PreviewWindow;
 const Pattern = pattern_mod.Pattern;
@@ -619,6 +620,37 @@ pub fn runFilter(
     writer.flush() catch {};
 }
 
+fn hasExpectedKey(expect: ?[]const u8, key_name: []const u8) bool {
+    const keys = expect orelse return false;
+    var it = std.mem.splitScalar(u8, keys, ',');
+    while (it.next()) |key| {
+        if (std.mem.eql(u8, std.mem.trim(u8, key, " \t"), key_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn writeTuiResult(args: *const Args, result: *const TuiResult) void {
+    const stdout = std.fs.File.stdout();
+    const output_delimiter: []const u8 = if (args.print0) "\x00" else "\n";
+
+    if (result.expected_key) |key| {
+        stdout.writeAll(key.name()) catch {};
+        stdout.writeAll(output_delimiter) catch {};
+    }
+
+    if (args.print_query) {
+        stdout.writeAll(result.query) catch {};
+        stdout.writeAll(output_delimiter) catch {};
+    }
+
+    for (result.selected.items) |item| {
+        stdout.writeAll(item) catch {};
+        stdout.writeAll(output_delimiter) catch {};
+    }
+}
+
 /// Run interactive TUI mode. Returns true if user aborted.
 pub fn runTui(
     allocator: std.mem.Allocator,
@@ -690,6 +722,7 @@ pub fn runTui(
         .preview = args.preview,
         .preview_window = preview_window,
         .scheme = args.scheme,
+        .expect_tab = hasExpectedKey(args.expect, "tab"),
     };
 
     // Run TUI
@@ -705,23 +738,11 @@ pub fn runTui(
     var result = try tui.run();
     defer result.deinit();
 
-    // Output results
-    const stdout = std.fs.File.stdout();
-    const output_delimiter: []const u8 = if (args.print0) "\x00" else "\n";
-
-    if (args.print_query) {
-        stdout.writeAll(result.query) catch {};
-        stdout.writeAll(output_delimiter) catch {};
-    }
-
     if (result.aborted) {
         return true; // Signal abort to caller
     }
 
-    for (result.selected.items) |item| {
-        stdout.writeAll(item) catch {};
-        stdout.writeAll(output_delimiter) catch {};
-    }
+    writeTuiResult(args, &result);
 
     return false;
 }
@@ -779,6 +800,7 @@ pub fn runTuiStreaming(
         .preview = args.preview,
         .preview_window = preview_window,
         .scheme = args.scheme,
+        .expect_tab = hasExpectedKey(args.expect, "tab"),
     };
 
     var tui = try Tui.init(allocator, &.{}, tui_config, ChunkSource{ .reader = reader });
@@ -791,23 +813,11 @@ pub fn runTuiStreaming(
     var result = try tui.run();
     defer result.deinit();
 
-    // Output results
-    const stdout = std.fs.File.stdout();
-    const output_delimiter: []const u8 = if (args.print0) "\x00" else "\n";
-
-    if (args.print_query) {
-        stdout.writeAll(result.query) catch {};
-        stdout.writeAll(output_delimiter) catch {};
-    }
-
     if (result.aborted) {
         return true; // Signal abort to caller
     }
 
-    for (result.selected.items) |item| {
-        stdout.writeAll(item) catch {};
-        stdout.writeAll(output_delimiter) catch {};
-    }
+    writeTuiResult(args, &result);
 
     return false;
 }
@@ -865,6 +875,7 @@ pub fn runTuiWithWalker(
         .preview = args.preview,
         .preview_window = preview_window,
         .scheme = args.scheme,
+        .expect_tab = hasExpectedKey(args.expect, "tab"),
     };
 
     var tui = try Tui.init(allocator, &.{}, tui_config, ChunkSource{ .walker = walker });
@@ -877,23 +888,11 @@ pub fn runTuiWithWalker(
     var result = try tui.run();
     defer result.deinit();
 
-    // Output results
-    const stdout = std.fs.File.stdout();
-    const output_delimiter: []const u8 = if (args.print0) "\x00" else "\n";
-
-    if (args.print_query) {
-        stdout.writeAll(result.query) catch {};
-        stdout.writeAll(output_delimiter) catch {};
-    }
-
     if (result.aborted) {
         return true;
     }
 
-    for (result.selected.items) |item| {
-        stdout.writeAll(item) catch {};
-        stdout.writeAll(output_delimiter) catch {};
-    }
+    writeTuiResult(args, &result);
 
     return false;
 }
@@ -943,6 +942,16 @@ fn runShellCommand(allocator: std.mem.Allocator, cmd: [*:0]const u8) ![]const u8
 
 test "Args.parse basic flags" {
     // This would need to mock argv for proper testing
+}
+
+test "hasExpectedKey parses comma-separated keys" {
+    const testing = std.testing;
+
+    try testing.expect(hasExpectedKey("tab", "tab"));
+    try testing.expect(hasExpectedKey("ctrl-t,tab,alt-enter", "tab"));
+    try testing.expect(hasExpectedKey(" ctrl-t, tab ", "tab"));
+    try testing.expect(!hasExpectedKey(null, "tab"));
+    try testing.expect(!hasExpectedKey("ctrl-t,enter", "tab"));
 }
 
 test "FieldRange.parse" {

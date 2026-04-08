@@ -88,6 +88,7 @@ pub const TuiConfig = struct {
     fullscreen: bool = false, // Use alternate screen buffer
     height: ?u16 = null, // Height in lines (null = use terminal height)
     scheme: @import("fzf.zig").Args.Scheme = .default,
+    expect_tab: bool = false,
 };
 
 /// Preview window configuration
@@ -132,12 +133,23 @@ pub const PreviewWindow = struct {
     }
 };
 
+pub const ExpectedKey = enum {
+    tab,
+
+    pub fn name(self: ExpectedKey) []const u8 {
+        return switch (self) {
+            .tab => "tab",
+        };
+    }
+};
+
 /// Result from the TUI
 pub const TuiResult = struct {
     allocator: Allocator,
     selected: std.ArrayList([]const u8),
     query: []const u8,
     aborted: bool,
+    expected_key: ?ExpectedKey = null,
 
     pub fn deinit(self: *TuiResult) void {
         self.selected.deinit(self.allocator);
@@ -484,6 +496,10 @@ pub const Tui = struct {
                     try self.clearDisplay();
                     return try self.buildResultAll();
                 },
+                .accept_tab => {
+                    try self.clearDisplay();
+                    return try self.buildResultWithExpectedKey(.tab);
+                },
             }
         }
     }
@@ -594,6 +610,7 @@ pub const Tui = struct {
         quit,
         accept,
         accept_all,
+        accept_tab,
     };
 
     fn handleEvent(self: *Tui, event: Event) !Action {
@@ -611,6 +628,10 @@ pub const Tui = struct {
                 // Handle Enter
                 if (k.key == .enter) {
                     return .accept;
+                }
+
+                if (k.key == .tab and self.config.expect_tab) {
+                    return .accept_tab;
                 }
 
                 // Handle Ctrl+A (accept all in multi mode)
@@ -1636,6 +1657,12 @@ pub const Tui = struct {
             }
         }
 
+        return result;
+    }
+
+    fn buildResultWithExpectedKey(self: *Tui, expected_key: ExpectedKey) !TuiResult {
+        var result = try self.buildResult();
+        result.expected_key = expected_key;
         return result;
     }
 
