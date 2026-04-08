@@ -87,6 +87,7 @@ pub const TuiConfig = struct {
     preview_window: PreviewWindow = .{},
     fullscreen: bool = false, // Use alternate screen buffer
     height: ?u16 = null, // Height in lines (null = use terminal height)
+    scheme: @import("fzf.zig").Args.Scheme = .default,
 };
 
 /// Preview window configuration
@@ -1056,9 +1057,14 @@ pub const Tui = struct {
             try results.append(self.allocator, res);
         }
 
-        std.mem.sort(SearchResult, results.items, {}, struct {
-            fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
-                return a.score > b.score;
+        const Scheme = @import("fzf.zig").Args.Scheme;
+        const scheme = self.config.scheme;
+        std.mem.sort(SearchResult, results.items, scheme, struct {
+            fn lessThan(s: Scheme, a: SearchResult, b: SearchResult) bool {
+                if (a.score != b.score) return a.score > b.score;
+                // History scheme: preserve input order (lower id = earlier = higher priority)
+                if (s == .history) return a.item.id < b.item.id;
+                return false;
             }
         }.lessThan);
 

@@ -33,6 +33,7 @@ pub const Args = struct {
     exact: bool = false,
     case_sensitive: bool = false,
     smart_case: bool = true,
+    scheme: Scheme = .default,
 
     // Interface
     multi: bool = false,
@@ -88,6 +89,12 @@ pub const Args = struct {
         reverse_list,
     };
 
+    pub const Scheme = enum {
+        default,
+        path,
+        history,
+    };
+
     /// Argument metadata for comptime parsing
     const Opt = struct {
         short: ?[]const u8 = null,
@@ -125,6 +132,7 @@ pub const Args = struct {
         .height = .{ .long = "--height", .takes_value = true },
         .min_height = .{ .long = "--min-height", .takes_value = true, .default_int = 10 },
         .layout = .{ .long = "--layout", .takes_value = true },
+        .scheme = .{ .long = "--scheme", .takes_value = true },
         .preview = .{ .long = "--preview", .takes_value = true },
         .preview_window = .{ .long = "--preview-window", .takes_value = true },
         .tabstop = .{ .long = "--tabstop", .takes_value = true, .default_int = 8 },
@@ -322,6 +330,14 @@ pub const Args = struct {
             } else {
                 args.layout = .default;
             }
+        } else if (FieldType == Scheme) {
+            if (std.mem.eql(u8, value, "history")) {
+                args.scheme = .history;
+            } else if (std.mem.eql(u8, value, "path")) {
+                args.scheme = .path;
+            } else {
+                args.scheme = .default;
+            }
         }
     }
 };
@@ -445,11 +461,7 @@ pub fn extractNthFields(allocator: std.mem.Allocator, line: []const u8, nth: []c
 pub const ScoredItem = struct {
     line: []const u8,
     score: u32,
-
-    pub fn lessThan(_: void, a: ScoredItem, b: ScoredItem) bool {
-        // Higher score first
-        return a.score > b.score;
-    }
+    index: usize = 0,
 };
 
 pub fn printHelp() void {
@@ -465,6 +477,7 @@ pub fn printHelp() void {
         \\  -e, --exact           Enable exact-match
         \\  -i                    Case-insensitive match
         \\  +i                    Case-sensitive match
+        \\  --scheme=SCHEME       Scoring scheme: default, path, history
         \\
         \\Interface:
         \\  -m, --multi           Enable multi-select
@@ -562,8 +575,10 @@ pub fn runFilter(
     defer scored_items.deinit(allocator);
 
     var lines = std.mem.splitScalar(u8, input, args.delimiter);
+    var line_idx: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
+        defer line_idx += 1;
 
         // Extract fields for matching if --nth is specified
         const match_text = if (args.nth) |nth| blk: {
@@ -577,12 +592,19 @@ pub fn runFilter(
         const haystack = Utf32Str.init(match_text, allocator, &buf);
         if (pattern.score(haystack, &matcher)) |s| {
             // Always output the original line, not the extracted fields
-            try scored_items.append(allocator, .{ .line = line, .score = s });
+            try scored_items.append(allocator, .{ .line = line, .score = s, .index = line_idx });
         }
     }
 
-    // Sort by score (highest first)
-    std.mem.sort(ScoredItem, scored_items.items, {}, ScoredItem.lessThan);
+    // Sort by score (highest first), with input order tiebreaker for history scheme
+    const scheme = args.scheme;
+    std.mem.sort(ScoredItem, scored_items.items, scheme, struct {
+        fn lessThan(s: Args.Scheme, a: ScoredItem, b: ScoredItem) bool {
+            if (a.score != b.score) return a.score > b.score;
+            if (s == .history) return a.index < b.index;
+            return false;
+        }
+    }.lessThan);
 
     const stdout = std.fs.File.stdout();
     var write_buf: [4096]u8 = undefined;
@@ -667,6 +689,7 @@ pub fn runTui(
         .with_nth = args.with_nth,
         .preview = args.preview,
         .preview_window = preview_window,
+        .scheme = args.scheme,
     };
 
     // Run TUI
@@ -755,6 +778,7 @@ pub fn runTuiStreaming(
         .with_nth = args.with_nth,
         .preview = args.preview,
         .preview_window = preview_window,
+        .scheme = args.scheme,
     };
 
     var tui = try Tui.init(allocator, &.{}, tui_config, ChunkSource{ .reader = reader });
@@ -840,6 +864,7 @@ pub fn runTuiWithWalker(
         .with_nth = args.with_nth,
         .preview = args.preview,
         .preview_window = preview_window,
+        .scheme = args.scheme,
     };
 
     var tui = try Tui.init(allocator, &.{}, tui_config, ChunkSource{ .walker = walker });
