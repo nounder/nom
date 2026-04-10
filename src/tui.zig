@@ -22,6 +22,7 @@ const StreamingWalker = @import("files.zig").StreamingWalker;
 const ParsedNth = @import("streaming_reader.zig").ParsedNth;
 const TopKHeap = @import("topk.zig").TopKHeap;
 const PreviewRunner = @import("preview.zig").PreviewRunner;
+const ansi = @import("ansi.zig");
 
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
@@ -1302,19 +1303,13 @@ pub const Tui = struct {
                 const byte = line[i];
 
                 // Handle ANSI escape sequences (pass through)
-                if (byte == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
-                    // Find end of escape sequence
-                    var j = i + 2;
-                    while (j < line.len) : (j += 1) {
-                        const c = line[j];
-                        if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) {
-                            j += 1;
-                            break;
-                        }
+                if (byte == 0x1b) {
+                    const scan = ansi.scanEscapeSequence(line[i..]);
+                    if (scan.valid) {
+                        try self.term.write(line[i .. i + scan.len]);
+                        i += scan.len;
+                        continue;
                     }
-                    try self.term.write(line[i..j]);
-                    i = j;
-                    continue;
                 }
 
                 // Regular character
@@ -1535,8 +1530,21 @@ pub const Tui = struct {
         var char_pos: usize = 0;
 
         while (byte_pos < text.len and col < max_width) {
-            // Get codepoint length
             const byte = text[byte_pos];
+
+            // Handle ANSI escape sequences
+            if (byte == 0x1b) {
+                const scan = ansi.scanEscapeSequence(text[byte_pos..]);
+                if (scan.valid) {
+                    if (self.config.ansi) {
+                        try self.term.write(text[byte_pos .. byte_pos + scan.len]);
+                    }
+                    byte_pos += scan.len;
+                    continue;
+                }
+            }
+
+            // Get codepoint length
             const cp_len: usize = if (byte < 0x80)
                 1
             else if (byte < 0xE0)
