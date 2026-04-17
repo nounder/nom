@@ -15,6 +15,7 @@ const tui_mod = @import("tui.zig");
 const pattern_mod = @import("pattern.zig");
 const matcher_mod = @import("matcher.zig");
 const utf32_str = @import("utf32_str.zig");
+const ansi_mod = @import("ansi.zig");
 
 const Tui = tui_mod.Tui;
 const TuiConfig = tui_mod.TuiConfig;
@@ -52,7 +53,7 @@ pub const Args = struct {
     header_lines: usize = 0,
 
     // Display
-    ansi: bool = true,
+    ansi: bool = false,
     tabstop: usize = 8,
     no_bold: bool = false,
 
@@ -614,7 +615,20 @@ pub fn runFilter(
     const output_delimiter: u8 = if (args.print0) 0 else '\n';
 
     for (scored_items.items) |item| {
-        writer.writeAll(item.line) catch {};
+        if (args.ansi) {
+            var i: usize = 0;
+            while (i < item.line.len) {
+                const scan = ansi_mod.scanEscapeSequence(item.line[i..]);
+                if (scan.valid) {
+                    i += scan.len;
+                } else {
+                    writer.writeByte(item.line[i]) catch {};
+                    i += 1;
+                }
+            }
+        } else {
+            writer.writeAll(item.line) catch {};
+        }
         writer.writeByte(output_delimiter) catch {};
     }
     writer.flush() catch {};
@@ -646,8 +660,28 @@ fn writeTuiResult(args: *const Args, result: *const TuiResult) void {
     }
 
     for (result.selected.items) |item| {
-        stdout.writeAll(item) catch {};
+        writeMaybeStripped(stdout, item, args.ansi);
         stdout.writeAll(output_delimiter) catch {};
+    }
+}
+
+/// Write `line` to `file`, stripping ANSI escape sequences when `strip` is true.
+/// Matches fzf: with `--ansi`, input colors are parsed for display and removed
+/// from the line that's printed on accept.
+fn writeMaybeStripped(file: std.fs.File, line: []const u8, strip: bool) void {
+    if (!strip) {
+        file.writeAll(line) catch {};
+        return;
+    }
+    var i: usize = 0;
+    while (i < line.len) {
+        const scan = ansi_mod.scanEscapeSequence(line[i..]);
+        if (scan.valid) {
+            i += scan.len;
+        } else {
+            file.writeAll(line[i .. i + 1]) catch {};
+            i += 1;
+        }
     }
 }
 
