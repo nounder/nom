@@ -49,6 +49,7 @@ const Args = struct {
     help: bool = false,
     version: bool = false,
     max_results: ?usize = null,
+    threads: ?usize = null,
 
     // Exclude patterns
     exclude_patterns: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -87,6 +88,7 @@ const Args = struct {
         .max_depth = Opt{ .short = "-d", .long = "--max-depth", .takes_value = true, .short_combined = true },
         .min_depth = Opt{ .long = "--min-depth", .takes_value = true },
         .max_results = Opt{ .long = "--max-results", .takes_value = true },
+        .threads = Opt{ .short = "-j", .long = "--threads", .takes_value = true, .short_combined = true },
     };
 
     pub const ParseError = error{
@@ -339,6 +341,7 @@ fn printHelp(io: std.Io) void {
         \\    -a, --absolute-path     Print absolute paths
         \\    -0, --print0            Separate results with null character
         \\    -c, --color <when>      When to use colors: auto, always, never
+        \\    -j, --threads <num>     Worker thread count (default: min(cpus, 12))
         \\
         \\EXAMPLES:
         \\    nom-fd                      List all non-hidden files
@@ -421,103 +424,91 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, arg_iter: anytype) !void {
         .follow_symlinks = args.follow,
         .exclude_patterns = args.exclude_patterns.items,
         .max_results = args.max_results,
+        .threads = args.threads,
     };
 
-    // Initialize finder
-    var finder = try fd.Finder.init(allocator, io, finder_opts);
-    defer finder.deinit();
-
-    // Get stdout
+    // stdout writer, guarded by a mutex since the walker callback runs on
+    // worker threads.
     const stdout = std.Io.File.stdout();
     var write_buf: [4096]u8 = undefined;
     var file_writer = stdout.writer(io, &write_buf);
     const writer = &file_writer.interface;
 
-    // Output format
     const output_fmt = fd.OutputFormat{
         .color = args.color,
         .null_separator = args.print0,
     };
 
-    // Search paths (default to current directory)
     const search_paths = if (args.paths.items.len > 0)
         args.paths.items
     else
         &[_][]const u8{"."};
 
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(allocator);
+    const Sink = struct {
+        mu: std.Io.Mutex = .init,
+        writer: *std.Io.Writer,
+        output_fmt: fd.OutputFormat,
+        absolute_path: bool,
+        is_cwd_search: bool,
+        search_path: []const u8,
+        search_dir: std.Io.Dir,
+        io: std.Io,
+        /// Buffers used only under `mu`. Kept in the sink so we don't
+        /// reallocate per callback.
+        path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
+        joined: std.ArrayListUnmanaged(u8) = .empty,
+        allocator: std.mem.Allocator,
+
+        fn emit(self: *@This(), entry: fd.Entry) !bool {
+            const is_dir = entry.kind == .directory;
+
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+
+            const path: []const u8 = if (self.absolute_path) blk: {
+                const abs_len = try self.search_dir.realPathFile(self.io, entry.path, &self.path_buf);
+                break :blk self.path_buf[0..abs_len];
+            } else if (self.is_cwd_search) entry.path else blk: {
+                self.joined.clearRetainingCapacity();
+                try self.joined.appendSlice(self.allocator, self.search_path);
+                if (entry.path.len > 0) {
+                    try self.joined.append(self.allocator, '/');
+                    try self.joined.appendSlice(self.allocator, entry.path);
+                }
+                break :blk self.joined.items;
+            };
+
+            self.output_fmt.format(path, is_dir, self.writer) catch {};
+            return true;
+        }
+
+        fn emitOpaque(opaque_self: *anyopaque, entry: fd.Entry) anyerror!bool {
+            const s: *@This() = @ptrCast(@alignCast(opaque_self));
+            return s.emit(entry);
+        }
+    };
 
     for (search_paths) |search_path| {
-        // Open search directory
         var search_dir = std.Io.Dir.cwd().openDir(io, search_path, .{ .iterate = true }) catch |err| {
             std.debug.print("error: cannot access '{s}': {}\n", .{ search_path, err });
             continue;
         };
         defer search_dir.close(io);
 
-        // Start finder at this path
-        finder.start(search_dir) catch |err| switch (err) {
-            error.AlreadyStarted => {
-                // Re-initialize finder for next path
-                finder.deinit();
-                finder = try fd.Finder.init(allocator, io, finder_opts);
-                try finder.start(search_dir);
-            },
-            else => return err,
+        var sink: Sink = .{
+            .writer = writer,
+            .output_fmt = output_fmt,
+            .absolute_path = args.absolute_path,
+            .is_cwd_search = std.mem.eql(u8, search_path, "."),
+            .search_path = search_path,
+            .search_dir = search_dir,
+            .io = io,
+            .allocator = allocator,
         };
+        defer sink.joined.deinit(allocator);
 
-        const is_cwd_search = std.mem.eql(u8, search_path, ".");
-
-        // Iterate and output results
-        while (try finder.next()) |entry| {
-            const is_dir = entry.kind == .directory;
-
-            const path: []const u8 = if (args.absolute_path) blk: {
-                const abs_len = try search_dir.realPathFile(io, entry.path, &path_buf);
-                break :blk path_buf[0..abs_len];
-            } else if (is_cwd_search) entry.path else blk: {
-                joined.clearRetainingCapacity();
-                try joined.appendSlice(allocator, search_path);
-                if (entry.path.len > 0) {
-                    try joined.append(allocator, '/');
-                    try joined.appendSlice(allocator, entry.path);
-                }
-                break :blk joined.items;
-            };
-
-            output_fmt.format(path, is_dir, writer) catch {};
-        }
+        _ = try fd.find(allocator, io, search_dir, finder_opts, &sink, Sink.emitOpaque);
     }
     writer.flush() catch {};
 }
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
-    const arena = init.arena.allocator();
-
-    const argv = try init.minimal.args.toSlice(arena);
-
-    var iter = SliceIterator{ .slice = if (argv.len > 0) argv[1..] else &.{} };
-    try run(allocator, io, &iter);
-}
-
-/// Iterator adapter for a slice of arguments.
-const SliceIterator = struct {
-    slice: []const [:0]const u8,
-    index: usize = 0,
-
-    pub fn next(self: *SliceIterator) ?[:0]const u8 {
-        if (self.index >= self.slice.len) return null;
-        defer self.index += 1;
-        return self.slice[self.index];
-    }
-
-    pub fn skip(self: *SliceIterator) bool {
-        if (self.index >= self.slice.len) return false;
-        self.index += 1;
-        return true;
-    }
-};

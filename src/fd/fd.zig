@@ -1,33 +1,27 @@
 //! fd-zig: A fast file finder library inspired by fd.
 //!
-//! This module provides fd-like functionality for finding files:
-//! - Pattern matching (glob, fixed string)
-//! - File type filtering (file, directory, symlink, executable, empty)
-//! - Size and time constraints
-//! - Respects .gitignore
-//! - Output formatting with templates
+//! Layered on top of `parallel_walker` (shared N-worker walker). Filters and
+//! pattern matching run *inside* the walker's sink callback, where the
+//! parent directory handle is still open — so `stat()` / `isEmpty()` checks
+//! work without reopening anything.
 //!
-//! ## Example Usage
+//! ## Example
 //!
 //! ```zig
-//! const fd = @import("fd/fd.zig");
-//!
-//! // Simple search
-//! var finder = try fd.Finder.init(allocator, .{
-//!     .pattern = "*.zig",
+//! try fd.find(gpa, io, dir, .{
+//!     .search_pattern = "*.zig",
 //!     .pattern_kind = .glob,
-//! });
-//! defer finder.deinit();
-//!
-//! while (try finder.next()) |entry| {
-//!     std.debug.print("{s}\n", .{entry.path});
-//! }
+//! }, {}, struct {
+//!     fn emit(_: void, entry: fd.Entry) !void {
+//!         std.debug.print("{s}\n", .{entry.path});
+//!     }
+//! }.emit);
 //! ```
 
 const std = @import("std");
 pub const pattern = @import("pattern.zig");
 pub const filter = @import("filter.zig");
-pub const walker = @import("walker.zig");
+pub const parallel_walker = @import("parallel_walker.zig");
 pub const ignore = @import("ignore.zig");
 pub const output = @import("output.zig");
 
@@ -39,11 +33,8 @@ pub const Filter = filter.Filter;
 pub const FileType = filter.FileType;
 pub const SizeFilter = filter.SizeFilter;
 pub const TimeFilter = filter.TimeFilter;
-pub const Walker = walker.Walker;
-pub const WalkOptions = walker.WalkOptions;
-pub const Entry = walker.Entry;
-pub const IgnoreStack = ignore.IgnoreStack;
-pub const Gitignore = ignore.Gitignore;
+pub const WalkOptions = parallel_walker.WalkOptions;
+pub const Entry = parallel_walker.Entry;
 pub const OutputFormat = output.OutputFormat;
 pub const ColorMode = output.ColorMode;
 pub const FormatTemplate = output.FormatTemplate;
@@ -71,114 +62,190 @@ pub const FinderOptions = struct {
     follow_symlinks: bool = false,
     exclude_patterns: []const []const u8 = &.{},
 
+    // Parallelism
+    threads: ?usize = null,
+
     // Result limiting
     max_results: ?usize = null,
 };
 
-/// A file finder with fd-like semantics.
-/// Combines pattern matching, filtering, and directory walking into a single interface.
-pub const Finder = struct {
-    allocator: std.mem.Allocator,
-    options: FinderOptions,
-    compiled_pattern: ?Pattern,
-    file_filter: Filter,
-    inner_walker: Walker,
-    result_count: usize,
-    started: bool,
+/// Entry adapter used *during* sink callbacks. Wraps a `parallel_walker.Entry`
+/// and provides `stat()` / `isEmpty()` for the filter. The `parent_dir`
+/// handle is only valid for the duration of the callback.
+const FilterEntry = struct {
+    path: []const u8,
+    name: []const u8,
+    depth: usize,
+    kind: std.Io.File.Kind,
+    dir: std.Io.Dir,
+    io: std.Io,
+    cached_stat: ?std.Io.File.Stat = null,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: FinderOptions) !Finder {
-        // Compile pattern if provided
-        var compiled: ?Pattern = null;
-        if (options.search_pattern) |pat| {
-            const case_sensitive = options.case_sensitive orelse !hasUppercase(pat);
-            compiled = try Pattern.init(allocator, pat, options.pattern_kind, .{
-                .case_sensitive = case_sensitive,
-                .full_path = options.full_path,
-            });
-        }
-        errdefer if (compiled) |*p| p.deinit(allocator);
-
-        // Build filter
-        const file_filter = Filter{
-            .file_types = options.file_types,
-            .extensions = options.extensions,
-            .size_filters = options.size_filters,
-            .time_filters = options.time_filters,
-            .min_depth = options.min_depth,
-            .max_depth = options.max_depth,
-        };
-
-        // Build walker
-        const walk_opts = WalkOptions{
-            .ignore_hidden = options.ignore_hidden,
-            .read_gitignore = options.read_gitignore,
-            .require_git = options.require_git,
-            .follow_symlinks = options.follow_symlinks,
-            .max_depth = options.max_depth,
-            .min_depth = options.min_depth,
-            .exclude_patterns = options.exclude_patterns,
-        };
-
-        return .{
-            .allocator = allocator,
-            .options = options,
-            .compiled_pattern = compiled,
-            .file_filter = file_filter,
-            .inner_walker = Walker.init(allocator, io, ".", walk_opts),
-            .result_count = 0,
-            .started = false,
-        };
+    pub fn stat(self: *FilterEntry) !std.Io.File.Stat {
+        if (self.cached_stat) |s| return s;
+        const s = try self.dir.statFile(self.io, self.name, .{});
+        self.cached_stat = s;
+        return s;
     }
 
-    pub fn deinit(self: *Finder) void {
-        if (self.compiled_pattern) |*p| p.deinit(self.allocator);
-        self.inner_walker.deinit();
-    }
-
-    /// Start the finder from a specific directory.
-    pub fn start(self: *Finder, dir: std.Io.Dir) !void {
-        if (self.started) return error.AlreadyStarted;
-        self.started = true;
-        try self.inner_walker.start(dir);
-    }
-
-    /// Get the next matching entry.
-    pub fn next(self: *Finder) !?Entry {
-        // Check max results
-        if (self.options.max_results) |max| {
-            if (self.result_count >= max) return null;
-        }
-
-        while (try self.inner_walker.next()) |entry| {
-            // Apply pattern matching
-            if (self.compiled_pattern) |*p| {
-                const match_text = if (self.options.full_path) entry.path else entry.name;
-                if (!p.matches(match_text)) continue;
-            }
-
-            // Apply filters
-            var mutable_entry = entry;
-            if (!try self.file_filter.matches(&mutable_entry)) continue;
-
-            self.result_count += 1;
-            return entry;
-        }
-
-        return null;
-    }
-
-    /// Collect all matching entries into a slice.
-    pub fn collect(self: *Finder, allocator: std.mem.Allocator) ![]Entry {
-        var results: std.ArrayListUnmanaged(Entry) = .empty;
-        errdefer results.deinit(allocator);
-
-        while (try self.next()) |entry| {
-            try results.append(allocator, entry);
-        }
-
-        return results.toOwnedSlice(allocator);
+    pub fn isEmpty(self: *FilterEntry) !bool {
+        if (self.kind != .directory) return false;
+        var subdir = try self.dir.openDir(self.io, self.name, .{ .iterate = true });
+        defer subdir.close(self.io);
+        var it = subdir.iterate();
+        return (try it.next(self.io)) == null;
     }
 };
+
+/// Run a search: walk `dir` in parallel, apply pattern + filters, invoke
+/// `callback` for each matching entry. The callback runs on worker threads;
+/// the entry's `parent_dir` is live during the call and closed afterwards,
+/// so any `stat`-like work must happen synchronously.
+///
+/// Stops (cleanly) when `callback` returns `false` or when `max_results` is
+/// reached.
+/// Callback: `(ctx, entry) -> keep_going`. Return `false` to stop the walk.
+pub const FindCallback = *const fn (ctx: *anyopaque, entry: Entry) anyerror!bool;
+
+pub fn find(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    options: FinderOptions,
+    ctx: *anyopaque,
+    callback: FindCallback,
+) !usize {
+    // Compile pattern (once, outside the walker).
+    var compiled: ?Pattern = null;
+    if (options.search_pattern) |pat| {
+        const case_sensitive = options.case_sensitive orelse !hasUppercase(pat);
+        compiled = try Pattern.init(allocator, pat, options.pattern_kind, .{
+            .case_sensitive = case_sensitive,
+            .full_path = options.full_path,
+        });
+    }
+    defer if (compiled) |*p| p.deinit(allocator);
+
+    const file_filter: Filter = .{
+        .file_types = options.file_types,
+        .extensions = options.extensions,
+        .size_filters = options.size_filters,
+        .time_filters = options.time_filters,
+        .min_depth = options.min_depth,
+        .max_depth = options.max_depth,
+    };
+
+    const walk_opts: WalkOptions = .{
+        .ignore_hidden = options.ignore_hidden,
+        .read_gitignore = options.read_gitignore,
+        .require_git = options.require_git,
+        .follow_symlinks = options.follow_symlinks,
+        .max_depth = options.max_depth,
+        .min_depth = options.min_depth,
+        .exclude_patterns = options.exclude_patterns,
+    };
+
+    const Ctx = struct {
+        // Passed from outer scope via pointer.
+        pattern: ?*const Pattern,
+        filter: Filter,
+        options: *const FinderOptions,
+        user_ctx: *anyopaque,
+        user_cb: FindCallback,
+        walker: ?*parallel_walker.ParallelWalker = null,
+
+        // Mutable — guarded by mu.
+        mu: std.Io.Mutex = .init,
+        count: usize = 0,
+        /// Set by the sink to tell the walker "stop". The walker has a
+        /// `cancel()` method but we don't have access to `*ParallelWalker`
+        /// from inside the sink, so we check a flag and drop subsequent
+        /// emits on the floor. (Workers will still enumerate a bit more
+        /// before noticing, but it's bounded.)
+        stop: bool = false,
+
+        fn emit(opaque_self: *anyopaque, cb_io: std.Io, entry: Entry) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(opaque_self));
+
+            // Fast path: short-circuit on stop.
+            {
+                self.mu.lockUncancelable(cb_io);
+                const stopped = self.stop;
+                self.mu.unlock(cb_io);
+                if (stopped) return;
+            }
+
+            // Pattern match.
+            if (self.pattern) |p| {
+                const match_text = if (self.options.full_path) entry.path else entry.name;
+                if (!p.matches(match_text)) return;
+            }
+
+            // Filter — construct an adapter with access to parent_dir.
+            var fe: FilterEntry = .{
+                .path = entry.path,
+                .name = entry.name,
+                .depth = entry.depth,
+                .kind = entry.kind,
+                .dir = entry.parent_dir,
+                .io = cb_io,
+            };
+            if (!try self.filter.matches(&fe)) return;
+
+            // Past the gauntlet: count + user callback + max_results check.
+            var reached_limit = false;
+            self.mu.lockUncancelable(cb_io);
+            if (self.stop) {
+                self.mu.unlock(cb_io);
+                return;
+            }
+            if (self.options.max_results) |max| {
+                if (self.count >= max) {
+                    self.stop = true;
+                    if (self.walker) |walker| walker.cancel();
+                    self.mu.unlock(cb_io);
+                    return;
+                }
+            }
+            self.count += 1;
+            if (self.options.max_results) |max| {
+                reached_limit = self.count >= max;
+            }
+            self.mu.unlock(cb_io);
+
+            const keep_going = try self.user_cb(self.user_ctx, entry);
+            if (!keep_going or reached_limit) {
+                self.mu.lockUncancelable(cb_io);
+                self.stop = true;
+                if (self.walker) |walker| walker.cancel();
+                self.mu.unlock(cb_io);
+            }
+        }
+    };
+
+    var c: Ctx = .{
+        .pattern = if (compiled) |*p| p else null,
+        .filter = file_filter,
+        .options = &options,
+        .user_ctx = ctx,
+        .user_cb = callback,
+    };
+
+    const workers = options.threads orelse parallel_walker.defaultWorkerCount();
+    const pw = try parallel_walker.ParallelWalker.init(
+        allocator,
+        io,
+        walk_opts,
+        .{ .emitFn = Ctx.emit, .ctx = &c },
+        workers,
+    );
+    defer pw.deinit();
+    c.walker = pw;
+
+    try pw.run(dir);
+
+    return c.count;
+}
 
 /// Check if a string contains uppercase ASCII characters.
 /// Used for smart case detection.
@@ -187,27 +254,6 @@ pub fn hasUppercase(s: []const u8) bool {
         if (c >= 'A' and c <= 'Z') return true;
     }
     return false;
-}
-
-/// Helper to create a finder and iterate in one go.
-/// Useful for simple one-off searches.
-pub fn find(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    dir: std.Io.Dir,
-    options: FinderOptions,
-    callback: fn (Entry) anyerror!bool, // Return false to stop
-) !usize {
-    var finder = try Finder.init(allocator, io, options);
-    defer finder.deinit();
-    try finder.start(dir);
-
-    var count: usize = 0;
-    while (try finder.next()) |entry| {
-        count += 1;
-        if (!try callback(entry)) break;
-    }
-    return count;
 }
 
 // Tests
@@ -222,28 +268,56 @@ test "hasUppercase" {
     try std.testing.expect(hasUppercase("foo.Zig"));
 }
 
-test "Finder init" {
+test "find basic" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var finder = try Finder.init(allocator, io, .{
+    var counter: usize = 0;
+    const total = try find(allocator, io, std.Io.Dir.cwd(), .{
         .search_pattern = "*.zig",
         .pattern_kind = .glob,
-    });
-    defer finder.deinit();
+    }, &counter, struct {
+        fn emit(ctx: *anyopaque, _: Entry) anyerror!bool {
+            const c: *usize = @ptrCast(@alignCast(ctx));
+            _ = @atomicRmw(usize, c, .Add, 1, .monotonic);
+            return true;
+        }
+    }.emit);
 
-    try std.testing.expect(finder.compiled_pattern != null);
+    try std.testing.expect(total > 0);
+    try std.testing.expectEqual(total, counter);
 }
 
-test "Finder with file types" {
+test "find max_results cancels traversal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var finder = try Finder.init(allocator, io, .{
-        .file_types = .{ .file = true },
-        .extensions = &[_][]const u8{"zig"},
-    });
-    defer finder.deinit();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
 
-    try std.testing.expect(finder.options.file_types.?.file);
+    var first = try tmp.dir.createDirPathOpen(io, "first", .{ .open_options = .{ .iterate = true } });
+    first.close(io);
+
+    const oversized = try allocator.alloc(u8, 1024 * 1024 + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, '#');
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "first/.gitignore",
+        .data = oversized,
+    });
+
+    var counter: usize = 0;
+    const total = try find(allocator, io, tmp.dir, .{
+        .max_results = 1,
+        .threads = 1,
+    }, &counter, struct {
+        fn emit(ctx: *anyopaque, _: Entry) anyerror!bool {
+            const c: *usize = @ptrCast(@alignCast(ctx));
+            c.* += 1;
+            return true;
+        }
+    }.emit);
+
+    try std.testing.expectEqual(@as(usize, 1), total);
+    try std.testing.expectEqual(@as(usize, 1), counter);
 }

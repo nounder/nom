@@ -29,46 +29,18 @@ pub fn build(b: *std.Build) void {
     }
 
     // ============================================================
-    // fd executable (nom-fd)
-    // ============================================================
-    const fd_exe = b.addExecutable(.{
-        .name = "nom-fd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/fd/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    b.installArtifact(fd_exe);
-
-    const fd_run_step = b.step("fd", "Run the fd-like file finder");
-    const fd_run_cmd = b.addRunArtifact(fd_exe);
-    fd_run_step.dependOn(&fd_run_cmd.step);
-    fd_run_cmd.step.dependOn(b.getInstallStep());
-
-    if (b.args) |args| {
-        fd_run_cmd.addArgs(args);
-    }
-
-    // ============================================================
     // Tests
     // ============================================================
-    // Test the main executable module
+    // Test the main executable module. Since `nom` imports `fd/main.zig`,
+    // which imports the rest of the fd module tree, this single test step
+    // exercises both the fzf/tui side and the fd side.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // Test the fd module
-    const fd_tests = b.addTest(.{
-        .root_module = fd_exe.root_module,
-    });
-    const run_fd_tests = b.addRunArtifact(fd_tests);
-
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_fd_tests.step);
 
     // ============================================================
     // Benchmarks
