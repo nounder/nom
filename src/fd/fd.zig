@@ -99,8 +99,9 @@ const FilterEntry = struct {
 
 /// Run a search: walk `dir` in parallel, apply pattern + filters, invoke
 /// `callback` for each matching entry. The callback runs on worker threads;
-/// the entry's `parent_dir` is live during the call and closed afterwards,
-/// so any `stat`-like work must happen synchronously.
+/// the entry's `path`, `name`, and `parent_dir` are live only during the call
+/// and may be reused or closed afterwards, so any retention or `stat`-like
+/// work must happen synchronously or via copies made by the callback.
 ///
 /// Stops (cleanly) when `callback` returns `false` or when `max_results` is
 /// reached.

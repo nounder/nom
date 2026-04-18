@@ -129,8 +129,9 @@ fn levelRelative(path_len: usize, name: []const u8, rel_path: []const u8) []cons
 /// An entry emitted by the parallel walker.
 ///
 /// Lifetime rules:
-/// - `path` and `name` live in the walker's arena (valid until
-///   `ParallelWalker.deinit`). Sinks that outlive the walker must copy.
+/// - `path` and `name` are borrowed from the worker's scratch buffer and are
+///   **only valid during the sink callback**. The worker reuses that buffer as
+///   soon as `emit` returns, so sinks that retain entries must copy them.
 /// - `parent_dir` is the worker's currently-open handle for this entry's
 ///   containing directory. It is **only valid during the sink callback**;
 ///   the worker closes it as soon as `emit` returns. Sinks that buffer
@@ -563,10 +564,6 @@ pub const ParallelWalker = struct {
                 continue;
             }
 
-            // Copy path into arena for emission + any queued work.
-            const owned_path = try self.arenaDupe(rel_path);
-            const owned_name = owned_path[name_start..];
-
             // Depth check for emission.
             const emit_depth = work.depth;
             const pass_min = if (self.options.min_depth) |min| emit_depth >= min else true;
@@ -576,8 +573,9 @@ pub const ParallelWalker = struct {
                 // queued work — the processor opens the dir on demand.
                 const can_descend = if (self.options.max_depth) |max| emit_depth < max else true;
                 if (can_descend) {
+                    const queued_path = try self.arenaDupe(rel_path);
                     try self.deques[worker_id].pushLocal(self.io, .{
-                        .path = owned_path,
+                        .path = queued_path,
                         .depth = emit_depth + 1,
                         .parent_node = node,
                     });
@@ -586,8 +584,8 @@ pub const ParallelWalker = struct {
 
                 if (pass_min) {
                     try self.sink.emit(self.io, .{
-                        .path = owned_path,
-                        .name = owned_name,
+                        .path = rel_path,
+                        .name = name,
                         .depth = emit_depth,
                         .kind = de.kind,
                         .parent_dir = dir,
@@ -596,8 +594,8 @@ pub const ParallelWalker = struct {
             } else {
                 if (pass_min) {
                     try self.sink.emit(self.io, .{
-                        .path = owned_path,
-                        .name = owned_name,
+                        .path = rel_path,
+                        .name = name,
                         .depth = emit_depth,
                         .kind = de.kind,
                         .parent_dir = dir,
