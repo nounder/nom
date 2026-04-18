@@ -10,6 +10,17 @@
 
 const std = @import("std");
 
+/// Helper exposed to walker: read a file via the Io interface with a size limit.
+pub fn readFileAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    max_size: usize,
+) ![]u8 {
+    return dir.readFileAlloc(io, sub_path, allocator, .limited(max_size));
+}
+
 /// A compiled ignore pattern.
 pub const IgnorePattern = struct {
     pattern: []const u8,
@@ -143,14 +154,14 @@ pub const IgnoreFile = struct {
     }
 
     /// Load ignore patterns from an absolute path.
-    pub fn loadAbsolute(allocator: std.mem.Allocator, path: []const u8) !?IgnoreFile {
-        const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+    pub fn loadAbsolute(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?IgnoreFile {
+        const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound, error.AccessDenied, error.PermissionDenied => return null,
             else => return err,
         };
         errdefer allocator.free(content);
 
-        var patterns: std.ArrayListUnmanaged(IgnorePattern) = .{};
+        var patterns: std.ArrayListUnmanaged(IgnorePattern) = .empty;
         errdefer patterns.deinit(allocator);
 
         parseInto(allocator, content, &patterns);
@@ -179,7 +190,7 @@ pub const IgnoreFile = struct {
             return null;
         }
 
-        var patterns: std.ArrayListUnmanaged(IgnorePattern) = .{};
+        var patterns: std.ArrayListUnmanaged(IgnorePattern) = .empty;
         errdefer patterns.deinit(allocator);
 
         for (contents) |content| {
@@ -275,27 +286,29 @@ const IgnoreLevel = struct {
 /// Implements proper gitignore hierarchy with last-match-wins semantics.
 pub const IgnoreStack = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     options: IgnoreOptions,
     levels: std.ArrayListUnmanaged(IgnoreLevel),
     global_fdignore: ?IgnoreFile,
 
-    pub fn init(allocator: std.mem.Allocator, options: IgnoreOptions) IgnoreStack {
-        // Load global ~/.fdignore
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: IgnoreOptions) IgnoreStack {
+        // Load global ~/.fdignore. Ignore failures silently — this is best-effort.
         var global_fdignore: ?IgnoreFile = null;
         if (options.read_global_fdignore) {
-            if (std.posix.getenv("HOME")) |home| {
-                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (homeDir()) |home| {
+                var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const path = std.fmt.bufPrint(&path_buf, "{s}/.fdignore", .{home}) catch null;
                 if (path) |p| {
-                    global_fdignore = IgnoreFile.loadAbsolute(allocator, p) catch null;
+                    global_fdignore = IgnoreFile.loadAbsolute(allocator, io, p) catch null;
                 }
             }
         }
 
         return .{
             .allocator = allocator,
+            .io = io,
             .options = options,
-            .levels = .{},
+            .levels = .empty,
             .global_fdignore = global_fdignore,
         };
     }
@@ -381,6 +394,23 @@ pub const IgnoreStack = struct {
         return result orelse false;
     }
 };
+
+/// Return the `HOME` environment variable (POSIX-only). Returns `null` if not set
+/// or on platforms without libc's `getenv`.
+fn homeDir() ?[]const u8 {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    if (!builtin.link_libc) {
+        // Without libc, iterate over `std.os.environ` (argv-style) directly.
+        for (std.os.environ) |entry| {
+            const e = std.mem.span(entry);
+            if (std.mem.startsWith(u8, e, "HOME=")) return e[5..];
+        }
+        return null;
+    }
+    const c_home = std.c.getenv("HOME") orelse return null;
+    return std.mem.span(c_home);
+}
 
 // Tests
 

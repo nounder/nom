@@ -17,11 +17,11 @@ fn defaultWalkOptions() fd.WalkOptions {
 
 /// Walk a directory and collect all file paths into a newline-separated buffer.
 /// Behaves like fd: skips hidden files and respects .gitignore / .ignore / .fdignore.
-pub fn walk(allocator: std.mem.Allocator, dir: std.fs.Dir) ![]const u8 {
+pub fn walk(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]const u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
 
-    var walker = fd.Walker.init(allocator, ".", defaultWalkOptions());
+    var walker = fd.Walker.init(allocator, io, ".", defaultWalkOptions());
     defer walker.deinit();
     try walker.start(dir);
 
@@ -36,7 +36,8 @@ pub fn walk(allocator: std.mem.Allocator, dir: std.fs.Dir) ![]const u8 {
 
 test "walk" {
     const allocator = std.testing.allocator;
-    const result = try walk(allocator, std.fs.cwd());
+    const io = std.testing.io;
+    const result = try walk(allocator, io, std.Io.Dir.cwd());
     defer allocator.free(result);
     try std.testing.expect(result.len > 0);
 }
@@ -48,30 +49,32 @@ pub const StreamingWalker = struct {
     const CHUNK_SIZE: usize = 100;
 
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
     thread: ?std.Thread = null,
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     queue: std.ArrayListUnmanaged(chunk.Chunk),
     head: usize = 0,
     done: bool = false,
     error_state: ?anyerror = null,
     next_id: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir) StreamingWalker {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) StreamingWalker {
         return .{
             .allocator = allocator,
+            .io = io,
             .dir = dir,
-            .queue = .{},
+            .queue = .empty,
         };
     }
 
     pub fn deinit(self: *StreamingWalker) void {
         if (self.thread) |t| {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.done = true;
-            self.condition.signal();
-            self.mutex.unlock();
+            self.condition.signal(self.io);
+            self.mutex.unlock(self.io);
             t.join();
         }
 
@@ -91,20 +94,20 @@ pub const StreamingWalker = struct {
     }
 
     pub fn isDone(self: *StreamingWalker) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.done;
     }
 
     pub fn checkError(self: *StreamingWalker) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.error_state) |err| return err;
     }
 
     pub fn pollChunk(self: *StreamingWalker) ?chunk.Chunk {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.head >= self.queue.items.len) return null;
 
@@ -126,29 +129,29 @@ pub const StreamingWalker = struct {
 
     fn walkerThread(self: *StreamingWalker) void {
         self.walkLoop() catch |err| {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.error_state = err;
             self.done = true;
-            self.condition.signal();
-            self.mutex.unlock();
+            self.condition.signal(self.io);
+            self.mutex.unlock(self.io);
         };
     }
 
     fn walkLoop(self: *StreamingWalker) !void {
-        var walker = fd.Walker.init(self.allocator, ".", defaultWalkOptions());
+        var walker = fd.Walker.init(self.allocator, self.io, ".", defaultWalkOptions());
         defer walker.deinit();
         try walker.start(self.dir);
 
-        var paths: std.ArrayListUnmanaged([]const u8) = .{};
+        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
         defer paths.deinit(self.allocator);
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
 
         while (true) {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             const should_stop = self.done;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             if (should_stop) break;
 
             const entry = try walker.next() orelse break;
@@ -171,10 +174,10 @@ pub const StreamingWalker = struct {
             arena.deinit();
         }
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.done = true;
-        self.condition.signal();
-        self.mutex.unlock();
+        self.condition.signal(self.io);
+        self.mutex.unlock(self.io);
     }
 
     fn flushChunk(
@@ -194,15 +197,15 @@ pub const StreamingWalker = struct {
             self.next_id += 1;
         }
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         try self.queue.append(self.allocator, .{
             .items = items,
             .data = &.{},
             .arena = arena.*,
         });
-        self.condition.signal();
+        self.condition.signal(self.io);
 
         paths.clearRetainingCapacity();
     }

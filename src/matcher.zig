@@ -217,7 +217,6 @@ pub const Matcher = struct {
             }
         }
 
-
         if (compute_indices) {
             view_mut.reconstructOptimalPath(best_end, self.allocator, indices, matrix_len, @intCast(start));
         }

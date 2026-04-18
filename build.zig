@@ -92,9 +92,11 @@ pub fn build(b: *std.Build) void {
     // Install to ~/bin
     // ============================================================
     const home_install_step = b.step("home", "Install nom to ~/bin");
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = b.graph.environ_map.get("HOME") orelse "/tmp";
     const dest_path = b.fmt("{s}/bin/nom", .{home});
-    const copy_step = b.addSystemCommand(&.{ "cp", "-f" });
+    // `install` preserves the binary's ad-hoc code signature across the write;
+    // `cp` can invalidate it on macOS and cause SIGKILL at exec.
+    const copy_step = b.addSystemCommand(&.{ "install", "-m", "755" });
     copy_step.addArtifactArg(exe);
     copy_step.addArg(dest_path);
     home_install_step.dependOn(&copy_step.step);

@@ -28,7 +28,7 @@ pub const ChunkList = struct {
     pub fn init(allocator: std.mem.Allocator) ChunkList {
         return .{
             .allocator = allocator,
-            .chunks = .{},
+            .chunks = .empty,
         };
     }
 

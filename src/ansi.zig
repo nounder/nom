@@ -86,8 +86,8 @@ pub fn scanEscapeSequence(text: []const u8) ScanResult {
 /// Strip ANSI escape sequences from text, returning the visible text.
 /// Allocates a new string.
 pub fn stripAnsi(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    errdefer result.deinit();
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
 
     var i: usize = 0;
     while (i < text.len) {
@@ -95,12 +95,12 @@ pub fn stripAnsi(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         if (scan.valid) {
             i += scan.len;
         } else {
-            try result.append(text[i]);
+            try result.append(allocator, text[i]);
             i += 1;
         }
     }
 
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(allocator);
 }
 
 /// Count visible characters (excluding ANSI sequences) in text.

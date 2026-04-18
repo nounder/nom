@@ -317,9 +317,9 @@ pub const Atom = struct {
             return result;
         }
 
-        var matches = std.ArrayList(struct { item: T, score_val: u16 }){};
+        var matches: std.ArrayList(struct { item: T, score_val: u16 }) = .empty;
         defer matches.deinit(allocator);
-        var buf = std.ArrayList(u21){};
+        var buf: std.ArrayList(u21) = .empty;
         defer buf.deinit(allocator);
 
         for (items) |item| {

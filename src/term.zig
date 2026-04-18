@@ -15,8 +15,9 @@ const WRITE_BUFFER_SIZE = 4 * 1024;
 
 /// Terminal state for raw mode
 pub const Terminal = struct {
-    ttyin: std.fs.File, // For reading input
-    ttyout: std.fs.File, // For writing output
+    io: std.Io,
+    ttyin: std.Io.File, // For reading input
+    ttyout: std.Io.File, // For writing output
     original_termios: posix.termios,
     width: u16,
     height: u16,
@@ -26,7 +27,7 @@ pub const Terminal = struct {
     write_len: usize = 0,
 
     /// Initialize terminal and enter raw mode
-    pub fn init() !Terminal {
+    pub fn init(io: std.Io) !Terminal {
         // Ignore SIGTTOU during terminal setup. When stdin is redirected (piped),
         // the process becomes a "background" process relative to the TTY, and
         // tcsetattr will trigger SIGTTOU which stops the process by default.
@@ -40,17 +41,20 @@ pub const Terminal = struct {
         posix.sigaction(posix.SIG.TTOU, &ignore_action, &old_action);
         defer posix.sigaction(posix.SIG.TTOU, &old_action, null);
 
+        const cwd = std.Io.Dir.cwd();
+
         // Open /dev/tty for reading (user input)
-        const ttyin = std.fs.cwd().openFile("/dev/tty", .{ .mode = .read_only }) catch
+        const ttyin = cwd.openFile(io, "/dev/tty", .{ .mode = .read_only }) catch
             return error.NoTTY;
-        errdefer ttyin.close();
+        errdefer ttyin.close(io);
 
         // Open /dev/tty for writing (display output)
         // If this fails, fall back to stderr
-        const ttyout = std.fs.cwd().openFile("/dev/tty", .{ .mode = .write_only }) catch
-            std.fs.File.stderr();
+        const ttyout = cwd.openFile(io, "/dev/tty", .{ .mode = .write_only }) catch
+            std.Io.File.stderr();
 
         var self = Terminal{
+            .io = io,
             .ttyin = ttyin,
             .ttyout = ttyout,
             .original_termios = undefined,
@@ -71,13 +75,13 @@ pub const Terminal = struct {
     }
 
     /// Clean up and restore terminal
-    pub fn deinit(self: *Terminal) void {
+    pub fn deinit(self: *Terminal, io: std.Io) void {
         self.flush();
         self.disableRawMode() catch {};
-        self.ttyin.close();
+        self.ttyin.close(io);
         // Only close ttyout if it's not stderr
-        if (self.ttyout.handle != std.fs.File.stderr().handle) {
-            self.ttyout.close();
+        if (self.ttyout.handle != std.Io.File.stderr().handle) {
+            self.ttyout.close(io);
         }
     }
 
@@ -137,7 +141,7 @@ pub const Terminal = struct {
         }
 
         // Fallback: try stderr
-        const stderr_handle = std.fs.File.stderr().handle;
+        const stderr_handle = std.Io.File.stderr().handle;
         const result3 = posix.system.ioctl(stderr_handle, posix.T.IOCGWINSZ, @intFromPtr(&ws));
         if (result3 == 0 and ws.col > 0 and ws.row > 0) {
             self.width = ws.col;
@@ -173,7 +177,7 @@ pub const Terminal = struct {
     pub fn flush(self: *Terminal) void {
         if (self.write_len > 0) {
             // Single atomic write - prevents flicker
-            _ = self.ttyout.write(self.write_buf[0..self.write_len]) catch {};
+            self.ttyout.writeStreamingAll(self.io, self.write_buf[0..self.write_len]) catch {};
             self.write_len = 0;
         }
     }
@@ -188,14 +192,20 @@ pub const Terminal = struct {
     /// Read a single byte (with timeout)
     pub fn readByte(self: *Terminal) ?u8 {
         var buf: [1]u8 = undefined;
-        const n = self.ttyin.read(&buf) catch return null;
+        const n = self.ttyin.readStreaming(self.io, &.{&buf}) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return null,
+        };
         if (n == 0) return null;
         return buf[0];
     }
 
     /// Read multiple bytes
     pub fn read(self: *Terminal, buf: []u8) usize {
-        return self.ttyin.read(buf) catch 0;
+        return self.ttyin.readStreaming(self.io, &.{buf}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => 0,
+        };
     }
 
     // === Cursor Control ===
@@ -232,7 +242,7 @@ pub const Terminal = struct {
 
     /// Write directly to terminal, bypassing buffer (for queries that need immediate response)
     fn writeImmediate(self: *Terminal, bytes: []const u8) !void {
-        _ = try self.ttyout.write(bytes);
+        try self.ttyout.writeStreamingAll(self.io, bytes);
     }
 
     /// Query cursor position and return (row, col), both 1-indexed

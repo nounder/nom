@@ -7,6 +7,7 @@ pub const StreamingReader = struct {
     const SLAB_SIZE: usize = 128 * 1024; // 128KB
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     delimiter: u8,
     header_lines: usize,
     nth: ?[]const u8,
@@ -14,8 +15,8 @@ pub const StreamingReader = struct {
 
     // Thread + coordination
     thread: ?std.Thread = null,
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     queue: std.ArrayList(chunk.Chunk),
     head: usize = 0,
     done: bool = false,
@@ -24,6 +25,7 @@ pub const StreamingReader = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         delimiter: u8,
         header_lines: usize,
         nth: ?[]const u8,
@@ -31,20 +33,21 @@ pub const StreamingReader = struct {
     ) StreamingReader {
         return .{
             .allocator = allocator,
+            .io = io,
             .delimiter = delimiter,
             .header_lines = header_lines,
             .nth = nth,
             .with_nth = with_nth,
-            .queue = .{},
+            .queue = .empty,
         };
     }
 
     pub fn deinit(self: *StreamingReader) void {
         if (self.thread) |t| {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.done = true;
-            self.condition.signal();
-            self.mutex.unlock();
+            self.condition.signal(self.io);
+            self.mutex.unlock(self.io);
             t.join();
         }
 
@@ -59,27 +62,27 @@ pub const StreamingReader = struct {
     }
 
     /// Start reading from the given file handle in a background thread.
-    pub fn start(self: *StreamingReader, file: std.fs.File) !void {
+    pub fn start(self: *StreamingReader, file: std.Io.File) !void {
         self.thread = try std.Thread.spawn(.{}, readerThread, .{ self, file });
     }
 
     /// Returns true when the reader finished (successfully or with error).
     pub fn isDone(self: *StreamingReader) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.done;
     }
 
     pub fn checkError(self: *StreamingReader) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.error_state) |err| return err;
     }
 
     /// Non-blocking: pop the next available chunk if any.
     pub fn pollChunk(self: *StreamingReader) ?chunk.Chunk {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.head >= self.queue.items.len) return null;
 
@@ -100,19 +103,19 @@ pub const StreamingReader = struct {
         return c;
     }
 
-    fn readerThread(self: *StreamingReader, file: std.fs.File) void {
+    fn readerThread(self: *StreamingReader, file: std.Io.File) void {
         self.readLoop(file) catch |err| {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.error_state = err;
             self.done = true;
-            self.condition.signal();
-            self.mutex.unlock();
+            self.condition.signal(self.io);
+            self.mutex.unlock(self.io);
         };
     }
 
-    fn readLoop(self: *StreamingReader, file: std.fs.File) !void {
+    fn readLoop(self: *StreamingReader, file: std.Io.File) !void {
         var slab = try self.allocator.alloc(u8, SLAB_SIZE);
-        var lines_buf = std.ArrayList([]const u8){};
+        var lines_buf: std.ArrayList([]const u8) = .empty;
         defer lines_buf.deinit(self.allocator);
 
         var leftover: []u8 = &.{};
@@ -123,11 +126,15 @@ pub const StreamingReader = struct {
         var with_nth_ranges = try ParsedNth.init(self.allocator, self.with_nth);
         defer with_nth_ranges.deinit();
 
+        // File reader with its own buffer (positional/streaming abstraction)
+        var fr_buf: [BUFFER_SIZE]u8 = undefined;
+        var fr = file.readerStreaming(self.io, &fr_buf);
+
         while (true) {
             // Stop early if signaled
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             const should_stop = self.done;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             if (should_stop) break;
 
             // Ensure we have space to read more into slab
@@ -160,9 +167,8 @@ pub const StreamingReader = struct {
                 std.mem.copyForwards(u8, slab[0..leftover.len], leftover);
             }
 
-            const n = file.read(slab[leftover.len .. leftover.len + available]) catch |err| {
-                if (err == error.EndOfStream) break;
-                return err;
+            const n = fr.interface.readSliceShort(slab[leftover.len .. leftover.len + available]) catch |err| switch (err) {
+                error.ReadFailed => return err,
             };
 
             if (n == 0) break;
@@ -208,10 +214,10 @@ pub const StreamingReader = struct {
             self.allocator.free(slab);
         }
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.done = true;
-        self.condition.signal();
-        self.mutex.unlock();
+        self.condition.signal(self.io);
+        self.mutex.unlock(self.io);
     }
 
     fn flushChunk(
@@ -242,15 +248,15 @@ pub const StreamingReader = struct {
             self.next_id += 1;
         }
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         try self.queue.append(self.allocator, .{
             .items = items,
             .data = slab,
             .arena = arena,
         });
-        self.condition.signal();
+        self.condition.signal(self.io);
     }
 };
 
@@ -262,7 +268,7 @@ pub const ParsedNth = struct {
     pub fn init(allocator: std.mem.Allocator, spec: ?[]const u8) !ParsedNth {
         var self = ParsedNth{
             .allocator = allocator,
-            .ranges = .{},
+            .ranges = .empty,
         };
 
         if (spec) |s| {
@@ -286,7 +292,7 @@ pub const ParsedNth = struct {
             return line;
         }
 
-        var fields = std.ArrayList([]const u8){};
+        var fields: std.ArrayList([]const u8) = .empty;
         defer fields.deinit(self.allocator);
 
         // Split by spaces/tabs to mirror existing extractNthFields
@@ -310,7 +316,7 @@ pub const ParsedNth = struct {
             return line;
         }
 
-        var result = std.ArrayList(u8){};
+        var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
 
         var first = true;

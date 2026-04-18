@@ -21,13 +21,12 @@ const BenchResult = struct {
     iterations: usize,
 };
 
-fn benchmark(comptime name: []const u8, iterations: usize, comptime func: anytype) BenchResult {
+fn benchmark(comptime name: []const u8, io: std.Io, iterations: usize, comptime func: anytype) BenchResult {
     // Warmup
     for (0..WARMUP_ITERATIONS) |_| {
         std.mem.doNotOptimizeAway(@call(.never_inline, func, .{}));
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
     var min_ns: u64 = std.math.maxInt(u64);
     var max_ns: u64 = 0;
     var total_ns: u64 = 0;
@@ -37,11 +36,12 @@ fn benchmark(comptime name: []const u8, iterations: usize, comptime func: anytyp
     const num_batches = iterations / batch_size;
 
     for (0..num_batches) |_| {
-        timer.reset();
+        const start = std.Io.Clock.awake.now(io);
         for (0..batch_size) |_| {
             std.mem.doNotOptimizeAway(@call(.never_inline, func, .{}));
         }
-        const elapsed = timer.read();
+        const end = std.Io.Clock.awake.now(io);
+        const elapsed: u64 = @intCast(start.durationTo(end).toNanoseconds());
         const per_iter = elapsed / batch_size;
         min_ns = @min(min_ns, per_iter);
         max_ns = @max(max_ns, per_iter);
@@ -149,7 +149,7 @@ fn runtimeStr(s: []u8) Utf32Str {
     return .{ .ascii = s };
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     std.debug.print("\n=== Nom Fuzzy Matcher Benchmarks ===\n\n", .{});
     std.debug.print("Iterations per benchmark: {}\n\n", .{BENCH_ITERATIONS});
 
@@ -158,7 +158,7 @@ pub fn main() !void {
     // ============================================================
     std.debug.print("--- Prefilter (ASCII) - SIMD Candidate ---\n", .{});
 
-    printResult(benchmark("prefilter: short (8 chars)", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("prefilter: short (8 chars)", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() usize {
             const cfg = Config.default();
             const result = prefilter.prefilterAscii(&cfg, &runtime_short_haystack, &runtime_short_needle, false);
@@ -166,7 +166,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("prefilter: medium (36 chars)", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("prefilter: medium (36 chars)", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() usize {
             const cfg = Config.default();
             const result = prefilter.prefilterAscii(&cfg, &runtime_medium_haystack, &runtime_medium_needle, false);
@@ -174,7 +174,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("prefilter: long (96 chars)", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("prefilter: long (96 chars)", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() usize {
             const cfg = Config.default();
             const result = prefilter.prefilterAscii(&cfg, &runtime_long_haystack, &runtime_long_needle, false);
@@ -182,7 +182,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("prefilter: 1006 chars", BENCH_ITERATIONS, struct {
+    printResult(benchmark("prefilter: 1006 chars", init.io, BENCH_ITERATIONS, struct {
         fn run() usize {
             const cfg = Config.default();
             const result = prefilter.prefilterAscii(&cfg, &runtime_prefilter_haystack, &runtime_prefilter_needle, false);
@@ -190,7 +190,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("prefilter: 1001 chars (target at end)", BENCH_ITERATIONS, struct {
+    printResult(benchmark("prefilter: 1001 chars (target at end)", init.io, BENCH_ITERATIONS, struct {
         fn run() usize {
             const cfg = Config.default();
             const result = prefilter.prefilterAscii(&cfg, &runtime_long_search, "z", false);
@@ -198,7 +198,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("prefilter: no match", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("prefilter: no match", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() usize {
             const cfg = Config.default();
             const result = prefilter.prefilterAscii(&cfg, &runtime_nomatch_haystack, &runtime_nomatch_needle, false);
@@ -206,7 +206,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("prefilter: case-sensitive short", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("prefilter: case-sensitive short", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() usize {
             var cfg = Config.default();
             cfg.ignore_case = false;
@@ -215,7 +215,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("prefilter: case-sensitive medium", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("prefilter: case-sensitive medium", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() usize {
             var cfg = Config.default();
             cfg.ignore_case = false;
@@ -229,25 +229,25 @@ pub fn main() !void {
     // ============================================================
     std.debug.print("\n--- Character Search (std.mem) ---\n", .{});
 
-    printResult(benchmark("std.mem.indexOfScalar: short (8)", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("std.mem.indexOfScalar: short (8)", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() usize {
             return std.mem.indexOfScalar(u8, &runtime_short_haystack, 'z') orelse std.math.maxInt(usize);
         }
     }.run));
 
-    printResult(benchmark("std.mem.indexOfScalar: medium (36)", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("std.mem.indexOfScalar: medium (36)", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() usize {
             return std.mem.indexOfScalar(u8, &runtime_medium_haystack, 'x') orelse std.math.maxInt(usize);
         }
     }.run));
 
-    printResult(benchmark("std.mem.indexOfScalar: 1001 chars", BENCH_ITERATIONS, struct {
+    printResult(benchmark("std.mem.indexOfScalar: 1001 chars", init.io, BENCH_ITERATIONS, struct {
         fn run() usize {
             return std.mem.indexOfScalar(u8, &runtime_long_search, 'z') orelse std.math.maxInt(usize);
         }
     }.run));
 
-    printResult(benchmark("std.mem.lastIndexOfScalar: 1001 chars", BENCH_ITERATIONS, struct {
+    printResult(benchmark("std.mem.lastIndexOfScalar: 1001 chars", init.io, BENCH_ITERATIONS, struct {
         fn run() usize {
             return std.mem.lastIndexOfScalar(u8, &runtime_long_search, 'a') orelse std.math.maxInt(usize);
         }
@@ -260,7 +260,7 @@ pub fn main() !void {
 
     const matcher = getGlobalMatcher();
 
-    printResult(benchmark("fuzzy: short string (8 chars)", BENCH_ITERATIONS, struct {
+    printResult(benchmark("fuzzy: short string (8 chars)", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_short_haystack);
             const n = runtimeStr(&runtime_short_needle);
@@ -268,7 +268,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("fuzzy: medium string (36 chars)", BENCH_ITERATIONS, struct {
+    printResult(benchmark("fuzzy: medium string (36 chars)", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_medium_haystack);
             const n = runtimeStr(&runtime_medium_needle);
@@ -276,7 +276,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("fuzzy: long string (96 chars)", BENCH_ITERATIONS, struct {
+    printResult(benchmark("fuzzy: long string (96 chars)", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_long_haystack);
             const n = runtimeStr(&runtime_long_needle);
@@ -284,7 +284,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("fuzzy: stress (248 chars, 15 needle)", BENCH_ITERATIONS / 10, struct {
+    printResult(benchmark("fuzzy: stress (248 chars, 15 needle)", init.io, BENCH_ITERATIONS / 10, struct {
         fn run() u16 {
             const h = asciiStr(STRESS_HAYSTACK);
             const n = asciiStr(STRESS_NEEDLE);
@@ -292,7 +292,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("fuzzy: worst case spread (305 chars)", BENCH_ITERATIONS / 10, struct {
+    printResult(benchmark("fuzzy: worst case spread (305 chars)", init.io, BENCH_ITERATIONS / 10, struct {
         fn run() u16 {
             const h = asciiStr(WORST_HAYSTACK);
             const n = asciiStr(WORST_NEEDLE);
@@ -300,7 +300,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("fuzzy: no match", BENCH_ITERATIONS, struct {
+    printResult(benchmark("fuzzy: no match", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_nomatch_haystack);
             const n = runtimeStr(&runtime_nomatch_needle);
@@ -313,7 +313,7 @@ pub fn main() !void {
     // ============================================================
     std.debug.print("\n--- Substring Match ---\n", .{});
 
-    printResult(benchmark("substring: short string", BENCH_ITERATIONS, struct {
+    printResult(benchmark("substring: short string", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_short_haystack);
             const n = asciiStr("main");
@@ -321,7 +321,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("substring: medium string", BENCH_ITERATIONS, struct {
+    printResult(benchmark("substring: medium string", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_medium_haystack);
             const n = runtimeStr(&runtime_medium_needle);
@@ -329,7 +329,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("substring: 1006 chars", BENCH_ITERATIONS, struct {
+    printResult(benchmark("substring: 1006 chars", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_prefilter_haystack);
             const n = runtimeStr(&runtime_prefilter_needle);
@@ -342,7 +342,7 @@ pub fn main() !void {
     // ============================================================
     std.debug.print("\n--- Single Character Match ---\n", .{});
 
-    printResult(benchmark("single char fuzzy: medium", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("single char fuzzy: medium", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_medium_haystack);
             const n = asciiStr("b");
@@ -350,7 +350,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("single char substring: medium", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("single char substring: medium", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_medium_haystack);
             const n = asciiStr("b");
@@ -363,7 +363,7 @@ pub fn main() !void {
     // ============================================================
     std.debug.print("\n--- Exact/Prefix/Postfix Match ---\n", .{});
 
-    printResult(benchmark("exact: medium string", BENCH_ITERATIONS, struct {
+    printResult(benchmark("exact: medium string", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_medium_haystack);
             const n = runtimeStr(&runtime_medium_haystack);
@@ -371,7 +371,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("prefix: medium string", BENCH_ITERATIONS, struct {
+    printResult(benchmark("prefix: medium string", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_medium_haystack);
             const n = asciiStr("src/comp");
@@ -379,7 +379,7 @@ pub fn main() !void {
         }
     }.run));
 
-    printResult(benchmark("postfix: medium string", BENCH_ITERATIONS, struct {
+    printResult(benchmark("postfix: medium string", init.io, BENCH_ITERATIONS, struct {
         fn run() u16 {
             const h = runtimeStr(&runtime_medium_haystack);
             const n = asciiStr(".tsx");
@@ -392,19 +392,19 @@ pub fn main() !void {
     // ============================================================
     std.debug.print("\n--- Case-Insensitive Compare (SIMD Candidate) ---\n", .{});
 
-    printResult(benchmark("ascii eql ignore case: 5 chars", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("ascii eql ignore case: 5 chars", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() bool {
             return asciiEqualIgnoreCase(&case_short_a, &case_short_b);
         }
     }.run));
 
-    printResult(benchmark("ascii eql ignore case: 16 chars", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("ascii eql ignore case: 16 chars", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() bool {
             return asciiEqualIgnoreCase(&case_medium_a, &case_medium_b);
         }
     }.run));
 
-    printResult(benchmark("ascii eql ignore case: 35 chars", BENCH_ITERATIONS * 10, struct {
+    printResult(benchmark("ascii eql ignore case: 35 chars", init.io, BENCH_ITERATIONS * 10, struct {
         fn run() bool {
             return asciiEqualIgnoreCase(&case_upper, &case_lower);
         }

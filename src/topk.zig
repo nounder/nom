@@ -11,7 +11,7 @@ pub fn TopKHeap(comptime T: type, comptime K: usize) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
-                .items = .{},
+                .items = .empty,
             };
         }
 

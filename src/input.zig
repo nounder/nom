@@ -211,7 +211,8 @@ pub const InputReader = struct {
         // Check if there's more data (escape sequence) or just ESC
         const next = self.peekByte() orelse {
             // Wait a bit for more input
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            const ts: posix.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = posix.system.nanosleep(&ts, null);
             // Try to read more
             self.buf_len = term.read(&self.buf);
             self.buf_pos = 0;

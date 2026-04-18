@@ -214,6 +214,7 @@ fn buildChunkFromLines(
 /// The interactive TUI
 pub const Tui = struct {
     allocator: Allocator,
+    io: std.Io,
     term: Terminal,
     reader: InputReader,
     config: TuiConfig,
@@ -272,12 +273,13 @@ pub const Tui = struct {
 
     pub fn init(
         allocator: Allocator,
+        io: std.Io,
         items: []const []const u8,
         config: TuiConfig,
         chunk_source: ?ChunkSource,
     ) !Tui {
-        var term = try Terminal.init();
-        errdefer term.deinit();
+        var term = try Terminal.init(io);
+        errdefer term.deinit(io);
 
         var matcher = try Matcher.initDefault(allocator);
         errdefer matcher.deinit();
@@ -292,10 +294,10 @@ pub const Tui = struct {
         var chunk_list = chunk.ChunkList.init(allocator);
         errdefer chunk_list.deinit();
 
-        var item_list = std.ArrayList(*const chunk.ChunkItem){};
+        var item_list: std.ArrayList(*const chunk.ChunkItem) = .empty;
         errdefer item_list.deinit(allocator);
 
-        var header_list = std.ArrayList(*const chunk.ChunkItem){};
+        var header_list: std.ArrayList(*const chunk.ChunkItem) = .empty;
         errdefer header_list.deinit(allocator);
 
         // Build initial chunk for static items
@@ -319,6 +321,7 @@ pub const Tui = struct {
 
         return Tui{
             .allocator = allocator,
+            .io = io,
             .term = term,
             .reader = .{},
             .config = config,
@@ -361,7 +364,7 @@ pub const Tui = struct {
         self.term.resetStyle() catch {};
         self.term.disableMouse() catch {};
         self.term.flush();
-        self.term.deinit();
+        self.term.deinit(self.io);
 
         // Stop preview runner
         if (self.preview_runner) |runner| {
@@ -437,7 +440,7 @@ pub const Tui = struct {
         // Initialize preview runner if preview is configured
         if (self.preview_cmd != null) {
             const runner = try self.allocator.create(PreviewRunner);
-            runner.* = PreviewRunner.init(self.allocator);
+            runner.* = PreviewRunner.init(self.allocator, self.io);
             try runner.start();
             self.preview_runner = runner;
         }
@@ -531,7 +534,7 @@ pub const Tui = struct {
         if (self.last_preview_item == current_id) return;
 
         // Throttle preview requests (like fzf's previewChunkDelay)
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Clock.awake.now(self.io).toMilliseconds();
         if (now - self.last_preview_request_time < self.preview_throttle_ms) {
             // Not enough time passed - will be picked up on next update
             return;
@@ -571,7 +574,7 @@ pub const Tui = struct {
 
         // Animate spinner while loading
         if (self.loading) {
-            const now = std.time.milliTimestamp();
+            const now = std.Io.Clock.awake.now(self.io).toMilliseconds();
             if (now - self.last_spinner_time >= 80) {
                 self.spinner_frame = @intCast((self.spinner_frame + 1) % spinner_frames.len);
                 self.last_spinner_time = now;
@@ -823,14 +826,14 @@ pub const Tui = struct {
 
     /// Check if enough time has passed to perform a search (throttle rapid searches)
     fn shouldPerformSearch(self: *Tui) bool {
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Clock.awake.now(self.io).toMilliseconds();
         const elapsed = now - self.last_search_time;
         return elapsed >= self.search_throttle_ms;
     }
 
     /// Update last search time
     fn updateLastSearchTime(self: *Tui) void {
-        self.last_search_time = std.time.milliTimestamp();
+        self.last_search_time = std.Io.Clock.awake.now(self.io).toMilliseconds();
     }
 
     /// Get item info at index for rendering (works in both modes)
@@ -1072,7 +1075,7 @@ pub const Tui = struct {
             }
         }
 
-        var results = std.ArrayList(SearchResult){};
+        var results: std.ArrayList(SearchResult) = .empty;
         defer results.deinit(self.allocator);
 
         while (heap.pop()) |res| {

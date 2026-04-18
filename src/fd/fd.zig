@@ -86,7 +86,7 @@ pub const Finder = struct {
     result_count: usize,
     started: bool,
 
-    pub fn init(allocator: std.mem.Allocator, options: FinderOptions) !Finder {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: FinderOptions) !Finder {
         // Compile pattern if provided
         var compiled: ?Pattern = null;
         if (options.search_pattern) |pat| {
@@ -124,7 +124,7 @@ pub const Finder = struct {
             .options = options,
             .compiled_pattern = compiled,
             .file_filter = file_filter,
-            .inner_walker = Walker.init(allocator, ".", walk_opts),
+            .inner_walker = Walker.init(allocator, io, ".", walk_opts),
             .result_count = 0,
             .started = false,
         };
@@ -136,7 +136,7 @@ pub const Finder = struct {
     }
 
     /// Start the finder from a specific directory.
-    pub fn start(self: *Finder, dir: std.fs.Dir) !void {
+    pub fn start(self: *Finder, dir: std.Io.Dir) !void {
         if (self.started) return error.AlreadyStarted;
         self.started = true;
         try self.inner_walker.start(dir);
@@ -193,11 +193,12 @@ pub fn hasUppercase(s: []const u8) bool {
 /// Useful for simple one-off searches.
 pub fn find(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
     options: FinderOptions,
     callback: fn (Entry) anyerror!bool, // Return false to stop
 ) !usize {
-    var finder = try Finder.init(allocator, options);
+    var finder = try Finder.init(allocator, io, options);
     defer finder.deinit();
     try finder.start(dir);
 
@@ -223,8 +224,9 @@ test "hasUppercase" {
 
 test "Finder init" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var finder = try Finder.init(allocator, .{
+    var finder = try Finder.init(allocator, io, .{
         .search_pattern = "*.zig",
         .pattern_kind = .glob,
     });
@@ -235,8 +237,9 @@ test "Finder init" {
 
 test "Finder with file types" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var finder = try Finder.init(allocator, .{
+    var finder = try Finder.init(allocator, io, .{
         .file_types = .{ .file = true },
         .extensions = &[_][]const u8{"zig"},
     });

@@ -150,8 +150,8 @@ pub const TimeFilter = struct {
 
     /// Parse duration string like "1d", "2h", "30min", "1week"
     /// Returns a TimeFilter relative to now.
-    pub fn parseDuration(spec: []const u8, mode: Mode) !TimeFilter {
-        const now = std.time.timestamp();
+    pub fn parseDuration(io: std.Io, spec: []const u8, mode: Mode) !TimeFilter {
+        const now = std.Io.Clock.real.now(io).toSeconds();
         const seconds = try parseDurationSeconds(spec);
         return .{
             .timestamp = now - seconds,
@@ -254,7 +254,7 @@ pub const Filter = struct {
 
             // Time check
             for (self.time_filters) |tf| {
-                const mtime_sec: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+                const mtime_sec: i64 = stat.mtime.toSeconds();
                 if (!tf.matches(mtime_sec)) return false;
             }
         }
@@ -284,7 +284,7 @@ fn matchesFileType(ft: FileType, entry: anytype) bool {
         if (builtin.os.tag != .windows) {
             const stat = entry.stat() catch return false;
             // Check if any execute bit is set
-            if (stat.mode & 0o111 != 0) return true;
+            if (stat.permissions.toMode() & 0o111 != 0) return true;
         }
     }
 

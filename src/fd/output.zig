@@ -19,31 +19,20 @@ pub const ColorMode = enum {
 pub const OutputFormat = struct {
     color: ColorMode = .auto,
     null_separator: bool = false,
-    absolute_path: bool = false,
     template: ?FormatTemplate = null,
 
-    /// Format and write an entry to the writer.
-    pub fn format(self: OutputFormat, entry: anytype, writer: anytype) !void {
-        const path = entry.path;
-        const is_dir = entry.kind == .directory;
-
+    /// Format and write `path` to the writer. The caller is responsible for
+    /// resolving absolute paths before calling this function — `format` never
+    /// touches the filesystem.
+    pub fn format(self: OutputFormat, path: []const u8, is_dir: bool, writer: *std.Io.Writer) !void {
         if (self.template) |tmpl| {
             try tmpl.apply(path, writer);
-        } else if (self.absolute_path) {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const abs = try std.fs.cwd().realpath(path, &buf);
-            try writer.writeAll(abs);
-            if (is_dir) try writer.writeByte('/');
         } else {
             try writer.writeAll(path);
             if (is_dir) try writer.writeByte('/');
         }
 
-        if (self.null_separator) {
-            try writer.writeByte(0);
-        } else {
-            try writer.writeByte('\n');
-        }
+        try writer.writeByte(if (self.null_separator) 0 else '\n');
     }
 };
 
@@ -137,7 +126,7 @@ pub const FormatTemplate = struct {
         self.allocator.free(self.tokens);
     }
 
-    pub fn apply(self: FormatTemplate, path: []const u8, writer: anytype) !void {
+    pub fn apply(self: FormatTemplate, path: []const u8, writer: *std.Io.Writer) !void {
         for (self.tokens) |token| {
             switch (token) {
                 .literal => |lit| try writer.writeAll(lit),
@@ -204,11 +193,11 @@ test "FormatTemplate.apply" {
     defer t.deinit();
 
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
 
-    try t.apply("src/main.zig", fbs.writer());
+    try t.apply("src/main.zig", &w);
 
-    try std.testing.expectEqualStrings("mv src/main.zig src/backup/main.bak", fbs.getWritten());
+    try std.testing.expectEqualStrings("mv src/main.zig src/backup/main.bak", w.buffered());
 }
 
 test "FormatTemplate escaped braces" {
@@ -218,60 +207,39 @@ test "FormatTemplate escaped braces" {
     defer t.deinit();
 
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
 
-    try t.apply("test.txt", fbs.writer());
+    try t.apply("test.txt", &w);
 
-    try std.testing.expectEqualStrings("{} is test.txt", fbs.getWritten());
+    try std.testing.expectEqualStrings("{} is test.txt", w.buffered());
 }
 
 test "OutputFormat basic" {
     const fmt = OutputFormat{};
-
-    const Entry = struct {
-        path: []const u8,
-        kind: std.fs.Dir.Entry.Kind,
-    };
-    const entry = Entry{ .path = "src/main.zig", .kind = .file };
-
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
 
-    try fmt.format(entry, fbs.writer());
+    try fmt.format("src/main.zig", false, &w);
 
-    try std.testing.expectEqualStrings("src/main.zig\n", fbs.getWritten());
+    try std.testing.expectEqualStrings("src/main.zig\n", w.buffered());
 }
 
 test "OutputFormat directory trailing slash" {
     const fmt = OutputFormat{};
-
-    const Entry = struct {
-        path: []const u8,
-        kind: std.fs.Dir.Entry.Kind,
-    };
-    const entry = Entry{ .path = "src", .kind = .directory };
-
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
 
-    try fmt.format(entry, fbs.writer());
+    try fmt.format("src", true, &w);
 
-    try std.testing.expectEqualStrings("src/\n", fbs.getWritten());
+    try std.testing.expectEqualStrings("src/\n", w.buffered());
 }
 
 test "OutputFormat null separator" {
     const fmt = OutputFormat{ .null_separator = true };
-
-    const Entry = struct {
-        path: []const u8,
-        kind: std.fs.Dir.Entry.Kind,
-    };
-    const entry = Entry{ .path = "test.txt", .kind = .file };
-
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
 
-    try fmt.format(entry, fbs.writer());
+    try fmt.format("test.txt", false, &w);
 
-    try std.testing.expectEqualStrings("test.txt\x00", fbs.getWritten());
+    try std.testing.expectEqualStrings("test.txt\x00", w.buffered());
 }

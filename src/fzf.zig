@@ -151,25 +151,6 @@ pub const Args = struct {
         OutOfMemory,
     };
 
-    /// Parse result containing args and argv (which must stay alive while args is in use)
-    pub const ParseResult = struct {
-        args: Args,
-        argv: [][:0]u8,
-        allocator: std.mem.Allocator,
-
-        pub fn deinit(self: *ParseResult) void {
-            std.process.argsFree(self.allocator, self.argv);
-        }
-    };
-
-    /// Parse command line arguments
-    pub fn parse(allocator: std.mem.Allocator) ParseError!ParseResult {
-        const argv = std.process.argsAlloc(allocator) catch return error.OutOfMemory;
-        errdefer std.process.argsFree(allocator, argv);
-        const args = try parseFromSlice(argv[1..]); // Skip program name
-        return .{ .args = args, .argv = argv, .allocator = allocator };
-    }
-
     /// Parse from a slice of arguments (does not include program name)
     pub fn parseFromSlice(argv: []const [:0]const u8) ParseError!Args {
         var args = Args{};
@@ -208,9 +189,7 @@ pub const Args = struct {
 
     /// Print unknown option error to stderr
     fn printUnknownOption(arg: []const u8) void {
-        std.fs.File.stderr().writeAll("unknown option: ") catch {};
-        std.fs.File.stderr().writeAll(arg) catch {};
-        std.fs.File.stderr().writeAll("\n") catch {};
+        std.debug.print("unknown option: {s}\n", .{arg});
     }
 
     /// Parse a single argument, returns true if handled (generic over argv type)
@@ -466,9 +445,12 @@ pub const ScoredItem = struct {
     index: usize = 0,
 };
 
-pub fn printHelp() void {
-    const stdout = std.fs.File.stdout();
-    stdout.writeAll(
+pub fn printHelp(io: std.Io) void {
+    const stdout = std.Io.File.stdout();
+    var buf: [4096]u8 = undefined;
+    var fw = stdout.writer(io, &buf);
+    const w = &fw.interface;
+    w.writeAll(
         \\nom - A fuzzy finder (fzf-compatible)
         \\
         \\Usage: nom [options]
@@ -523,16 +505,21 @@ pub fn printHelp() void {
         \\  --version             Show version
         \\
     ) catch {};
+    w.flush() catch {};
 }
 
-pub fn printVersion() void {
-    const stdout = std.fs.File.stdout();
-    stdout.writeAll("nom 0.1.0\n") catch {};
+pub fn printVersion(io: std.Io) void {
+    const stdout = std.Io.File.stdout();
+    var buf: [32]u8 = undefined;
+    var fw = stdout.writer(io, &buf);
+    fw.interface.writeAll("nom 0.1.0\n") catch {};
+    fw.interface.flush() catch {};
 }
 
 /// Run filter mode (no TUI, just output matching lines)
 pub fn runFilter(
     allocator: std.mem.Allocator,
+    io: std.Io,
     args: *const Args,
     input: []const u8,
 ) !void {
@@ -608,9 +595,9 @@ pub fn runFilter(
         }
     }.lessThan);
 
-    const stdout = std.fs.File.stdout();
+    const stdout = std.Io.File.stdout();
     var write_buf: [4096]u8 = undefined;
-    var file_writer = stdout.writer(&write_buf);
+    var file_writer = stdout.writer(io, &write_buf);
     const writer = &file_writer.interface;
     const output_delimiter: u8 = if (args.print0) 0 else '\n';
 
@@ -645,32 +632,37 @@ fn hasExpectedKey(expect: ?[]const u8, key_name: []const u8) bool {
     return false;
 }
 
-fn writeTuiResult(args: *const Args, result: *const TuiResult) void {
-    const stdout = std.fs.File.stdout();
+fn writeTuiResult(io: std.Io, args: *const Args, result: *const TuiResult) void {
+    const stdout = std.Io.File.stdout();
+    var buf: [4096]u8 = undefined;
+    var fw = stdout.writer(io, &buf);
+    const w = &fw.interface;
     const output_delimiter: []const u8 = if (args.print0) "\x00" else "\n";
 
     if (result.expected_key) |key| {
-        stdout.writeAll(key.name()) catch {};
-        stdout.writeAll(output_delimiter) catch {};
+        w.writeAll(key.name()) catch {};
+        w.writeAll(output_delimiter) catch {};
     }
 
     if (args.print_query) {
-        stdout.writeAll(result.query) catch {};
-        stdout.writeAll(output_delimiter) catch {};
+        w.writeAll(result.query) catch {};
+        w.writeAll(output_delimiter) catch {};
     }
 
     for (result.selected.items) |item| {
-        writeMaybeStripped(stdout, item, args.ansi);
-        stdout.writeAll(output_delimiter) catch {};
+        writeMaybeStripped(w, item, args.ansi);
+        w.writeAll(output_delimiter) catch {};
     }
+
+    w.flush() catch {};
 }
 
-/// Write `line` to `file`, stripping ANSI escape sequences when `strip` is true.
+/// Write `line` to `w`, stripping ANSI escape sequences when `strip` is true.
 /// Matches fzf: with `--ansi`, input colors are parsed for display and removed
 /// from the line that's printed on accept.
-fn writeMaybeStripped(file: std.fs.File, line: []const u8, strip: bool) void {
+fn writeMaybeStripped(w: *std.Io.Writer, line: []const u8, strip: bool) void {
     if (!strip) {
-        file.writeAll(line) catch {};
+        w.writeAll(line) catch {};
         return;
     }
     var i: usize = 0;
@@ -679,7 +671,7 @@ fn writeMaybeStripped(file: std.fs.File, line: []const u8, strip: bool) void {
         if (scan.valid) {
             i += scan.len;
         } else {
-            file.writeAll(line[i .. i + 1]) catch {};
+            w.writeByte(line[i]) catch {};
             i += 1;
         }
     }
@@ -688,6 +680,7 @@ fn writeMaybeStripped(file: std.fs.File, line: []const u8, strip: bool) void {
 /// Run interactive TUI mode. Returns true if user aborted.
 pub fn runTui(
     allocator: std.mem.Allocator,
+    io: std.Io,
     args: *const Args,
     input: []const u8,
 ) !bool {
@@ -760,7 +753,7 @@ pub fn runTui(
     };
 
     // Run TUI
-    var tui = try Tui.init(allocator, lines.items, tui_config, null);
+    var tui = try Tui.init(allocator, io, lines.items, tui_config, null);
     defer tui.deinit();
 
     // Set initial query if provided
@@ -776,7 +769,7 @@ pub fn runTui(
         return true; // Signal abort to caller
     }
 
-    writeTuiResult(args, &result);
+    writeTuiResult(io, args, &result);
 
     return false;
 }
@@ -784,6 +777,7 @@ pub fn runTui(
 /// Run interactive TUI mode with streaming input. Returns true if user aborted.
 pub fn runTuiStreaming(
     allocator: std.mem.Allocator,
+    io: std.Io,
     args: *const Args,
     reader: *StreamingReader,
 ) !bool {
@@ -837,7 +831,7 @@ pub fn runTuiStreaming(
         .expect_tab = hasExpectedKey(args.expect, "tab"),
     };
 
-    var tui = try Tui.init(allocator, &.{}, tui_config, ChunkSource{ .reader = reader });
+    var tui = try Tui.init(allocator, io, &.{}, tui_config, ChunkSource{ .reader = reader });
     defer tui.deinit();
 
     if (args.query) |q| {
@@ -851,7 +845,7 @@ pub fn runTuiStreaming(
         return true; // Signal abort to caller
     }
 
-    writeTuiResult(args, &result);
+    writeTuiResult(io, args, &result);
 
     return false;
 }
@@ -859,6 +853,7 @@ pub fn runTuiStreaming(
 /// Run interactive TUI mode with streaming file walker. Returns true if user aborted.
 pub fn runTuiWithWalker(
     allocator: std.mem.Allocator,
+    io: std.Io,
     args: *const Args,
     walker: *StreamingWalker,
 ) !bool {
@@ -912,7 +907,7 @@ pub fn runTuiWithWalker(
         .expect_tab = hasExpectedKey(args.expect, "tab"),
     };
 
-    var tui = try Tui.init(allocator, &.{}, tui_config, ChunkSource{ .walker = walker });
+    var tui = try Tui.init(allocator, io, &.{}, tui_config, ChunkSource{ .walker = walker });
     defer tui.deinit();
 
     if (args.query) |q| {
@@ -926,40 +921,51 @@ pub fn runTuiWithWalker(
         return true;
     }
 
-    writeTuiResult(args, &result);
+    writeTuiResult(io, args, &result);
 
     return false;
 }
 
 /// Check if stdin is connected to a TTY
-pub fn isStdinTty() bool {
-    return std.posix.isatty(std.posix.STDIN_FILENO);
+pub fn isStdinTty(io: std.Io) bool {
+    return std.Io.File.stdin().isTty(io) catch false;
 }
 
 /// Get default source when stdin is a TTY.
 /// Checks FZF_DEFAULT_COMMAND env var, falls back to built-in walker.
-pub fn getDefaultSource(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.posix.getenv("FZF_DEFAULT_COMMAND")) |cmd| {
-        return try runShellCommand(allocator, cmd);
+pub fn getDefaultSource(allocator: std.mem.Allocator, io: std.Io, environ_map: *std.process.Environ.Map) ![]const u8 {
+    if (environ_map.get("FZF_DEFAULT_COMMAND")) |cmd| {
+        return try runShellCommand(allocator, io, cmd);
     }
-    return try files.walk(allocator, std.fs.cwd());
+    return try files.walk(allocator, io, std.Io.Dir.cwd());
 }
 
 /// Run a shell command and return its stdout
-fn runShellCommand(allocator: std.mem.Allocator, cmd: [*:0]const u8) ![]const u8 {
-    const cmd_slice = std.mem.span(cmd);
-    var child = std.process.Child.init(&.{ "sh", "-c", cmd_slice }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+fn runShellCommand(allocator: std.mem.Allocator, io: std.Io, cmd: []const u8) ![]const u8 {
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", cmd },
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
 
-    const stdout = child.stdout orelse return error.NoStdout;
-    const result = try stdout.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    const stdout = child.stdout orelse {
+        _ = child.wait(io) catch {};
+        return error.NoStdout;
+    };
+
+    var buf: [64 * 1024]u8 = undefined;
+    var sr = stdout.readerStreaming(io, &buf);
+    const result = sr.interface.allocRemaining(allocator, .unlimited) catch |err| {
+        _ = child.wait(io) catch {};
+        return err;
+    };
     errdefer allocator.free(result);
 
-    const term = try child.wait();
+    stdout.close(io);
+
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) {
                 allocator.free(result);
                 return error.CommandFailed;

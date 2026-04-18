@@ -38,31 +38,16 @@ pub const PreviewResult = struct {
 };
 
 /// Asynchronous preview command runner.
-///
-/// Usage:
-/// ```zig
-/// var runner = try PreviewRunner.init(allocator);
-/// defer runner.deinit();
-///
-/// try runner.start();
-///
-/// // Request preview for selected item
-/// runner.request(.{ .command = "cat {}", .item = "/path/to/file", .query = "" });
-///
-/// // In event loop, poll for results
-/// if (runner.poll()) |result| {
-///     // Render result.lines to preview window
-/// }
-/// ```
 pub const PreviewRunner = struct {
     allocator: Allocator,
+    io: std.Io,
 
     // Worker thread
     thread: ?std.Thread = null,
 
     // Synchronization
-    mutex: std.Thread.Mutex = .{},
-    request_cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    request_cond: std.Io.Condition = .init,
 
     // Request state (protected by mutex)
     request_version: u64 = 0,
@@ -92,8 +77,8 @@ pub const PreviewRunner = struct {
         }
     };
 
-    pub fn init(allocator: Allocator) PreviewRunner {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: Allocator, io: std.Io) PreviewRunner {
+        return .{ .allocator = allocator, .io = io };
     }
 
     pub fn deinit(self: *PreviewRunner) void {
@@ -101,13 +86,13 @@ pub const PreviewRunner = struct {
         self.should_quit.store(true, .release);
 
         // Wake worker if waiting
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         // Kill any running child process
         if (self.current_child) |child| {
-            _ = child.kill() catch null;
+            child.kill(self.io);
         }
-        self.request_cond.signal();
-        self.mutex.unlock();
+        self.request_cond.signal(self.io);
+        self.mutex.unlock(self.io);
 
         // Wait for worker thread to exit
         if (self.thread) |t| {
@@ -115,8 +100,8 @@ pub const PreviewRunner = struct {
         }
 
         // Cleanup remaining state
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.pending_request) |*req| {
             req.deinit();
@@ -134,15 +119,15 @@ pub const PreviewRunner = struct {
     /// Request a preview for the given item.
     /// Cancels any in-progress preview automatically.
     pub fn request(self: *PreviewRunner, req: PreviewRequest) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Increment version (this implicitly cancels the old request)
         self.request_version += 1;
 
         // Kill currently running child if any
         if (self.current_child) |child| {
-            _ = child.kill() catch null;
+            child.kill(self.io);
         }
 
         // Free old pending request
@@ -171,18 +156,18 @@ pub const PreviewRunner = struct {
         };
 
         // Wake worker
-        self.request_cond.signal();
+        self.request_cond.signal(self.io);
     }
 
     /// Cancel any pending or in-progress preview.
     pub fn cancel(self: *PreviewRunner) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         self.request_version += 1;
 
         if (self.current_child) |child| {
-            _ = child.kill() catch null;
+            child.kill(self.io);
         }
 
         if (self.pending_request) |*req| {
@@ -195,16 +180,16 @@ pub const PreviewRunner = struct {
     /// Returns null if no new result is available.
     /// The returned result is valid until the next call to poll() or request().
     pub fn poll(self: *PreviewRunner) ?PreviewResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         return self.result;
     }
 
     /// Check if a preview is currently being processed.
     pub fn isLoading(self: *PreviewRunner) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Loading if we have a pending request or result isn't complete
         if (self.pending_request != null) return true;
@@ -216,8 +201,8 @@ pub const PreviewRunner = struct {
 
     /// Get the current request version (for checking if result is stale)
     pub fn getRequestVersion(self: *PreviewRunner) u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.request_version;
     }
 
@@ -237,11 +222,11 @@ pub const PreviewRunner = struct {
     }
 
     fn waitForRequest(self: *PreviewRunner) ?OwnedRequest {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         while (self.pending_request == null and !self.should_quit.load(.acquire)) {
-            self.request_cond.wait(&self.mutex);
+            self.request_cond.waitUncancelable(self.io, &self.mutex);
         }
 
         if (self.should_quit.load(.acquire)) {
@@ -255,8 +240,8 @@ pub const PreviewRunner = struct {
     }
 
     fn getRequestVersionLocked(self: *PreviewRunner) u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.request_version;
     }
 
@@ -272,31 +257,31 @@ pub const PreviewRunner = struct {
         if (self.isCancelled(version)) return;
 
         // Spawn the child process
-        var child = std.process.Child.init(&.{ "sh", "-c", expanded }, self.allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-
-        child.spawn() catch |err| {
+        var child = std.process.spawn(self.io, .{
+            .argv = &.{ "sh", "-c", expanded },
+            .stdout = .pipe,
+            .stderr = .pipe,
+        }) catch |err| {
             self.setErrorResult(version, @errorName(err));
             return;
         };
 
         // Register child for potential cancellation
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.current_child = &child;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         defer {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.current_child = null;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
         }
 
         // Read output
         self.readChildOutput(&child, version);
 
         // Wait for child to exit
-        _ = child.wait() catch {};
+        _ = child.wait(self.io) catch {};
     }
 
     fn readChildOutput(self: *PreviewRunner, child: *std.process.Child, version: u64) void {
@@ -307,19 +292,22 @@ pub const PreviewRunner = struct {
         errdefer result_arena.deinit();
         const arena_alloc = result_arena.allocator();
 
-        var lines = std.ArrayList([]const u8){};
-        var line_buf = std.ArrayList(u8){};
+        var lines: std.ArrayList([]const u8) = .empty;
+        var line_buf: std.ArrayList(u8) = .empty;
 
         // Read in chunks, checking for cancellation periodically
         var buf: [4096]u8 = undefined;
-        while (true) {
+        read_loop: while (true) {
             // Check cancellation before each read
             if (self.isCancelled(version)) {
                 result_arena.deinit();
                 return;
             }
 
-            const n = stdout.read(&buf) catch break;
+            const n = stdout.readStreaming(self.io, &.{&buf}) catch |err| switch (err) {
+                error.EndOfStream => break :read_loop,
+                else => break :read_loop,
+            };
             if (n == 0) break;
 
             // Process bytes into lines
@@ -358,8 +346,8 @@ pub const PreviewRunner = struct {
     fn isCancelled(self: *PreviewRunner, version: u64) bool {
         if (self.should_quit.load(.acquire)) return true;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.request_version != version;
     }
 
@@ -383,8 +371,8 @@ pub const PreviewRunner = struct {
         lines: []const []const u8,
         complete: bool,
     ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Check version under lock
         if (self.request_version != version) return;
@@ -411,8 +399,8 @@ pub const PreviewRunner = struct {
         complete: bool,
         error_msg: ?[]const u8,
     ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Check version under lock
         if (self.request_version != version) {
@@ -452,7 +440,7 @@ pub fn expandCommand(
     item: []const u8,
     query: []const u8,
 ) ![]const u8 {
-    var result = std.ArrayList(u8){};
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     var i: usize = 0;
@@ -558,7 +546,7 @@ test "expandCommand with single quotes" {
 
 test "appendQuoted empty" {
     const allocator = std.testing.allocator;
-    var list = std.ArrayList(u8){};
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
 
     try appendQuoted(&list, allocator, "");
@@ -567,7 +555,7 @@ test "appendQuoted empty" {
 
 test "appendQuoted simple" {
     const allocator = std.testing.allocator;
-    var list = std.ArrayList(u8){};
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
 
     try appendQuoted(&list, allocator, "simple");
@@ -576,7 +564,7 @@ test "appendQuoted simple" {
 
 test "appendQuoted with special chars" {
     const allocator = std.testing.allocator;
-    var list = std.ArrayList(u8){};
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
 
     try appendQuoted(&list, allocator, "has space");
