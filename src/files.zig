@@ -6,19 +6,20 @@ const fd = @import("fd/fd.zig");
 const parallel_walker = @import("fd/parallel_walker.zig");
 
 /// Default walker options for fzf-mode traversal (mirrors `nom fd` defaults).
-fn defaultWalkOptions() fd.WalkOptions {
+fn defaultWalkOptions(home_dir: ?[]const u8) fd.WalkOptions {
     return .{
         .ignore_hidden = true,
         .read_gitignore = true,
         .require_git = true,
         .read_ignore = true,
         .read_fdignore = true,
+        .home_dir = home_dir,
     };
 }
 
 /// Walk a directory and collect all file paths into a newline-separated buffer.
 /// Behaves like fd: skips hidden files and respects .gitignore / .ignore / .fdignore.
-pub fn walk(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]const u8 {
+pub fn walk(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, home_dir: ?[]const u8) ![]const u8 {
     const Ctx = struct {
         allocator: std.mem.Allocator,
         mu: std.Io.Mutex = .init,
@@ -40,7 +41,7 @@ pub fn walk(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]const 
     const pw = try parallel_walker.ParallelWalker.init(
         allocator,
         io,
-        defaultWalkOptions(),
+        defaultWalkOptions(home_dir),
         .{ .emitFn = Ctx.emit, .ctx = &ctx },
         parallel_walker.defaultWorkerCount(),
     );
@@ -54,7 +55,7 @@ pub fn walk(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]const 
 test "walk" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const result = try walk(allocator, io, std.Io.Dir.cwd());
+    const result = try walk(allocator, io, std.Io.Dir.cwd(), null);
     defer allocator.free(result);
     try std.testing.expect(result.len > 0);
 }
@@ -64,7 +65,7 @@ test "StreamingWalker end-to-end" {
     const io = std.testing.io;
 
     const dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
-    var sw = StreamingWalker.init(allocator, io, dir);
+    var sw = StreamingWalker.init(allocator, io, dir, null);
     defer sw.deinit();
 
     try sw.start();
@@ -99,6 +100,7 @@ pub const StreamingWalker = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
+    home_dir: ?[]const u8,
     thread: ?std.Thread = null,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
@@ -115,11 +117,12 @@ pub const StreamingWalker = struct {
     // Parallel walker owns its own cancelation; we call it on deinit.
     pw: ?*parallel_walker.ParallelWalker = null,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) StreamingWalker {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, home_dir: ?[]const u8) StreamingWalker {
         return .{
             .allocator = allocator,
             .io = io,
             .dir = dir,
+            .home_dir = home_dir,
             .queue = .empty,
             .pending_arena = std.heap.ArenaAllocator.init(allocator),
         };
@@ -223,7 +226,7 @@ pub const StreamingWalker = struct {
         const pw = try parallel_walker.ParallelWalker.init(
             self.allocator,
             self.io,
-            defaultWalkOptions(),
+            defaultWalkOptions(self.home_dir),
             sink,
             parallel_walker.defaultWorkerCount(),
         );

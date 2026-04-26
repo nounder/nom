@@ -365,7 +365,7 @@ fn printVersion(io: std.Io) void {
 }
 
 /// Run fd with the given argument iterator (skips first arg which should be program name or "fd")
-pub fn run(allocator: std.mem.Allocator, io: std.Io, arg_iter: anytype) !void {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, environ_map: *std.process.Environ.Map, arg_iter: anytype) !void {
     var args = Args.parseFromIter(allocator, arg_iter) catch |err| {
         if (err == error.InvalidArgument or err == error.MissingArgument or err == error.UnknownOption) {
             std.process.exit(1);
@@ -425,6 +425,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, arg_iter: anytype) !void {
         .exclude_patterns = args.exclude_patterns.items,
         .max_results = args.max_results,
         .threads = args.threads,
+        .home_dir = environ_map.get("HOME"),
     };
 
     // stdout writer, guarded by a mutex since the walker callback runs on

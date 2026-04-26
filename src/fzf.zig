@@ -937,7 +937,7 @@ pub fn getDefaultSource(allocator: std.mem.Allocator, io: std.Io, environ_map: *
     if (environ_map.get("FZF_DEFAULT_COMMAND")) |cmd| {
         return try runShellCommand(allocator, io, cmd);
     }
-    return try files.walk(allocator, io, std.Io.Dir.cwd());
+    return try files.walk(allocator, io, std.Io.Dir.cwd(), environ_map.get("HOME"));
 }
 
 /// Run a shell command and return its stdout

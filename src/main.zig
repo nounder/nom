@@ -3,12 +3,14 @@
 //! Usage: nom [options]
 //!        nom fzf [options]   - Run fzf-compatible fuzzy finder
 //!        nom fd [options]    - Run fd-compatible file finder
+//!        nom grep [options]  - Literal grep across a source tree
 //!
 //! Options are largely compatible with fd/fzf.
 
 const std = @import("std");
 const fzf = @import("fzf.zig");
 const fd_main = @import("fd/main.zig");
+const grep_main = @import("grep/main.zig");
 const files = @import("files.zig");
 const StreamingReader = @import("streaming_reader.zig").StreamingReader;
 const StreamingWalker = files.StreamingWalker;
@@ -24,7 +26,10 @@ pub fn main(init: std.process.Init) !void {
         const first_arg = argv[1];
         if (std.mem.eql(u8, first_arg, "fd")) {
             var arg_iter = SliceIterator{ .slice = argv[2..] };
-            return fd_main.run(allocator, io, &arg_iter);
+            return fd_main.run(allocator, io, init.environ_map, &arg_iter);
+        } else if (std.mem.eql(u8, first_arg, "grep")) {
+            var arg_iter = SliceIterator{ .slice = argv[2..] };
+            return grep_main.run(allocator, io, init.environ_map, &arg_iter);
         } else if (std.mem.eql(u8, first_arg, "fzf")) {
             const args = fzf.Args.parseFromSlice(argv[2..]) catch |err| switch (err) {
                 error.UnknownOption => std.process.exit(2),
@@ -91,7 +96,7 @@ fn runFzf(allocator: std.mem.Allocator, io: std.Io, environ_map: *std.process.En
             defer allocator.free(input);
             break :blk fzf.runTui(allocator, io, &args, input);
         } else {
-            var walker = StreamingWalker.init(allocator, io, std.Io.Dir.cwd());
+            var walker = StreamingWalker.init(allocator, io, std.Io.Dir.cwd(), environ_map.get("HOME"));
             defer walker.deinit();
             try walker.start();
             break :blk fzf.runTuiWithWalker(allocator, io, &args, &walker);

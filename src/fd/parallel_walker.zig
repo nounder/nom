@@ -29,6 +29,9 @@ pub const WalkOptions = struct {
     max_depth: ?usize = null,
     min_depth: ?usize = null,
     exclude_patterns: []const []const u8 = &.{},
+    /// Home directory used to load ~/.fdignore when `read_fdignore` is set.
+    /// Pass `init.environ_map.get("HOME")` from main; defaults to no lookup.
+    home_dir: ?[]const u8 = null,
 };
 
 /// A node in the walk tree: one per directory visited. Immutable after
@@ -238,7 +241,7 @@ pub const ParallelWalker = struct {
 
         // Load global ~/.fdignore once into the shared arena.
         if (options.read_fdignore) {
-            if (homeDir()) |home| {
+            if (options.home_dir) |home| {
                 var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 if (std.fmt.bufPrint(&path_buf, "{s}/.fdignore", .{home})) |p| {
                     self.global_fdignore = ignore.IgnoreFile.loadAbsolute(
@@ -628,20 +631,6 @@ fn detectGitFlag(io: std.Io, dir: std.Io.Dir) std.EnumSet(DirNode.Flag) {
         flags.insert(.git);
     } else |_| {}
     return flags;
-}
-
-fn homeDir() ?[]const u8 {
-    const builtin = @import("builtin");
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
-    if (!builtin.link_libc) {
-        for (std.os.environ) |entry| {
-            const e = std.mem.span(entry);
-            if (std.mem.startsWith(u8, e, "HOME=")) return e[5..];
-        }
-        return null;
-    }
-    const c_home = std.c.getenv("HOME") orelse return null;
-    return std.mem.span(c_home);
 }
 
 /// Default worker count — cap at 12 like ripgrep to avoid thrashing on

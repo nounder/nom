@@ -61,6 +61,8 @@ pub const FinderOptions = struct {
     require_git: bool = true,
     follow_symlinks: bool = false,
     exclude_patterns: []const []const u8 = &.{},
+    /// Home directory for ~/.fdignore lookup (typically `environ_map.get("HOME")`).
+    home_dir: ?[]const u8 = null,
 
     // Parallelism
     threads: ?usize = null,
@@ -144,6 +146,7 @@ pub fn find(
         .max_depth = options.max_depth,
         .min_depth = options.min_depth,
         .exclude_patterns = options.exclude_patterns,
+        .home_dir = options.home_dir,
     };
 
     const Ctx = struct {
