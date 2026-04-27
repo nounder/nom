@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const grep = @import("grep.zig");
+const match_list_mod = @import("match_list.zig");
+const tui = @import("tui.zig");
 
 const Args = struct {
     needle: ?[]const u8 = null,
@@ -28,6 +30,8 @@ const Args = struct {
     threads: ?usize = null,
 
     color: enum { auto, always, never } = .auto,
+    /// Custom empty-state prompt for interactive mode.
+    prompt: ?[]const u8 = null,
 
     help: bool = false,
     version: bool = false,
@@ -73,6 +77,10 @@ const Args = struct {
             }
             if (std.mem.eql(u8, arg, "-L") or std.mem.eql(u8, arg, "--follow")) {
                 args.follow = true;
+                continue;
+            }
+            if (try takeValueOpt(arg, null, "--prompt", arg_iter)) |v| {
+                args.prompt = v;
                 continue;
             }
 
@@ -211,6 +219,8 @@ fn printHelp(io: std.Io) void {
         \\
         \\  Output:
         \\        --color <when>         When to use colors: auto, always, never
+        \\        --prompt <text>        Empty-state hint shown above the query line
+        \\                               (interactive mode, when no PATTERN given)
         \\    -j, --threads <num>        Worker thread count
         \\
         \\EXAMPLES:
@@ -253,14 +263,21 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ_map: *std.process.E
         return;
     }
 
-    const needle = args.needle orelse {
-        std.debug.print("error: missing PATTERN\n", .{});
-        printHelp(io);
-        std.process.exit(2);
-    };
-
     const search_path = args.path orelse ".";
     const cwd = std.Io.Dir.cwd();
+    const stdout_is_tty = std.Io.File.stdout().isTty(io) catch false;
+
+    // Dispatch: PATTERN given → batch, regardless of TTY.
+    //          No PATTERN + TTY → TUI (the user types the needle there).
+    //          No PATTERN + non-TTY → error.
+    if (args.needle == null) {
+        if (!stdout_is_tty) {
+            std.debug.print("error: missing PATTERN\n", .{});
+            printHelp(io);
+            std.process.exit(2);
+        }
+        return runInteractive(allocator, io, environ_map, cwd, search_path, args);
+    }
 
     // Stat to decide: file vs directory. A non-existent path errors out.
     const st = cwd.statFile(io, search_path, .{}) catch |err| {
@@ -271,15 +288,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ_map: *std.process.E
     const use_color = switch (args.color) {
         .always => true,
         .never => false,
-        .auto => std.Io.File.stdout().isTty(io) catch false,
+        .auto => stdout_is_tty,
     };
 
-    var write_buf: [16 * 1024]u8 = undefined;
-    var fw = std.Io.File.stdout().writer(io, &write_buf);
-    const writer = &fw.interface;
-
     const opts: grep.Options = .{
-        .needle = needle,
+        .needle = args.needle.?,
         .case_insensitive = args.case_insensitive,
         .extensions = args.extensions.items,
         .before_context = args.before_context,
@@ -295,6 +308,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ_map: *std.process.E
         .use_color = use_color,
     };
 
+    var write_buf: [16 * 1024]u8 = undefined;
+    var fw = std.Io.File.stdout().writer(io, &write_buf);
+    const writer = &fw.interface;
+
     const total = if (st.kind == .directory) blk: {
         var search_dir = cwd.openDir(io, search_path, .{ .iterate = true }) catch |err| {
             std.debug.print("error: cannot open dir '{s}': {}\n", .{ search_path, err });
@@ -309,4 +326,70 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ_map: *std.process.E
 
     // Exit code 1 when no matches, 0 otherwise (BSD/GNU grep convention).
     if (total == 0) std.process.exit(1);
+}
+
+/// Run TUI mode. The TUI owns a `WalkerSession` and starts/stops searches
+/// as the user's query crosses the 3-character threshold. On selection,
+/// replaces the current process image with `$EDITOR +line file`.
+fn runInteractive(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+    cwd: std.Io.Dir,
+    search_path: []const u8,
+    args: Args,
+) !void {
+    var search_dir = cwd.openDir(io, search_path, .{ .iterate = true }) catch |err| {
+        std.debug.print("error: cannot open dir '{s}': {}\n", .{ search_path, err });
+        std.process.exit(1);
+    };
+    defer search_dir.close(io);
+
+    const display_root = if (std.mem.eql(u8, search_path, ".")) "" else search_path;
+    const base_opts: grep.Options = .{
+        .needle = "", // overridden per session
+        .case_insensitive = args.case_insensitive,
+        .extensions = args.extensions.items,
+        .before_context = 0,
+        .after_context = 0,
+        .ignore_hidden = !args.hidden,
+        .read_gitignore = !args.no_ignore,
+        .require_git = !args.no_ignore,
+        .follow_symlinks = args.follow,
+        .max_depth = args.max_depth,
+        .threads = args.threads,
+        .home_dir = environ_map.get("HOME"),
+        .exclude_patterns = args.exclude_patterns.items,
+        .use_color = false, // TUI handles its own coloring
+    };
+
+    var session = grep.WalkerSession.init(allocator, io, search_dir, display_root, base_opts);
+    defer session.deinit();
+
+    const sel_opt = try tui.run(allocator, io, &session, .{
+        .case_matching = if (args.case_insensitive) .ignore else .smart,
+        .empty_prompt = args.prompt orelse "type ≥3 chars to search",
+    });
+
+    if (sel_opt) |sel_const| {
+        var sel = sel_const;
+        defer sel.deinit();
+
+        // Cancel before exec so no walker threads outlive the new image.
+        session.cancel();
+
+        const editor = environ_map.get("EDITOR") orelse "vi";
+        var line_buf: [16]u8 = undefined;
+        const line_arg = std.fmt.bufPrint(&line_buf, "+{d}", .{sel.line_no}) catch "+1";
+
+        const err = std.process.replace(io, .{
+            .argv = &.{ editor, line_arg, sel.path },
+            .environ_map = environ_map,
+        });
+        std.debug.print("error: failed to exec {s}: {}\n", .{ editor, err });
+        std.process.exit(1);
+    }
+
+    // User aborted (Esc/Ctrl-C). Session deinit cancels the walker.
+    std.process.exit(130);
 }

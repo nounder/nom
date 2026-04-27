@@ -512,4 +512,3 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ_map: *std.process.E
     }
     writer.flush() catch {};
 }
-

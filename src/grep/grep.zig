@@ -10,6 +10,7 @@ const std = @import("std");
 const parallel_walker = @import("../fd/parallel_walker.zig");
 const searcher = @import("searcher.zig");
 const printer = @import("printer.zig");
+const match_list = @import("match_list.zig");
 
 pub const Options = struct {
     needle: []const u8,
@@ -227,6 +228,205 @@ pub fn run(
         .allocator = allocator,
         .opts = &options,
         .writer = writer,
+        .display_root = display_root,
+    };
+
+    const walk_opts: parallel_walker.WalkOptions = .{
+        .ignore_hidden = options.ignore_hidden,
+        .read_gitignore = options.read_gitignore,
+        .require_git = options.require_git,
+        .follow_symlinks = options.follow_symlinks,
+        .max_depth = options.max_depth,
+        .exclude_patterns = options.exclude_patterns,
+        .home_dir = options.home_dir,
+    };
+
+    const workers = options.threads orelse parallel_walker.defaultWorkerCount();
+    const pw = try parallel_walker.ParallelWalker.init(
+        allocator,
+        io,
+        walk_opts,
+        .{ .emitFn = Ctx.emit, .ctx = &ctx },
+        workers,
+    );
+    defer pw.deinit();
+
+    try pw.run(dir);
+
+    return ctx.match_total.load(.monotonic);
+}
+
+/// A live (or recently-cancelled) walker invocation feeding `list`. Owned
+/// and driven by the TUI: `start(needle)` kicks off a walk on a fresh
+/// `MatchList`; `cancel()` stops it; `deinit` makes sure no walker thread
+/// outlives the session. Designed so the TUI can swap the active query
+/// freely without tracking futures itself.
+pub const WalkerSession = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    display_root: []const u8,
+    base_opts: Options,
+
+    /// The list the active walker (if any) is feeding. Owned by the
+    /// session — replaced on each `start`. `null` before the first start.
+    list: ?*match_list.MatchList = null,
+
+    /// Future of the active walker. `null` when no walker is running.
+    /// Type-erased via the closure inside `start`.
+    future: ?Future = null,
+
+    const Future = std.Io.Future(void);
+
+    const Args = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        display_root: []const u8,
+        opts: Options,
+        list: *match_list.MatchList,
+
+        fn run(self: Args) void {
+            _ = runIntoList(self.allocator, self.io, self.dir, self.display_root, self.opts, self.list) catch {};
+            self.list.markDone();
+        }
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        display_root: []const u8,
+        base_opts: Options,
+    ) WalkerSession {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .dir = dir,
+            .display_root = display_root,
+            .base_opts = base_opts,
+        };
+    }
+
+    /// Cancel any in-flight walker and free its `MatchList`. Always safe
+    /// to call.
+    pub fn cancel(self: *WalkerSession) void {
+        if (self.future) |*f| {
+            _ = f.cancel(self.io);
+            self.future = null;
+        }
+        if (self.list) |l| {
+            l.deinit();
+            self.allocator.destroy(l);
+            self.list = null;
+        }
+    }
+
+    pub fn deinit(self: *WalkerSession) void {
+        self.cancel();
+    }
+
+    /// Cancel any active walker and start a new one searching for
+    /// `needle`. The returned `*MatchList` is owned by the session and
+    /// stays valid until the next `start` or `cancel`.
+    pub fn start(self: *WalkerSession, needle: []const u8) !*match_list.MatchList {
+        self.cancel();
+
+        const list_ptr = try self.allocator.create(match_list.MatchList);
+        errdefer self.allocator.destroy(list_ptr);
+        list_ptr.* = match_list.MatchList.init(self.allocator, self.io);
+        errdefer list_ptr.deinit();
+
+        var opts = self.base_opts;
+        opts.needle = needle;
+
+        const args: Args = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .dir = self.dir,
+            .display_root = self.display_root,
+            .opts = opts,
+            .list = list_ptr,
+        };
+        self.future = self.io.async(Args.run, .{args});
+        self.list = list_ptr;
+        return list_ptr;
+    }
+};
+
+/// Walk `dir` and push every match into `list`. Same walker semantics as
+/// `run`, but the destination is structured (no formatting, no `Writer`).
+/// Context lines are not collected — the TUI shows just the match line.
+pub fn runIntoList(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    display_root: []const u8,
+    options: Options,
+    list: *match_list.MatchList,
+) !usize {
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        opts: *const Options,
+        list: *match_list.MatchList,
+        display_root: []const u8,
+        match_total: std.atomic.Value(usize) = .init(0),
+
+        fn emit(opaque_self: *anyopaque, cb_io: std.Io, entry: parallel_walker.Entry) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(opaque_self));
+            if (entry.kind != .file) return;
+            if (!extensionAllowed(entry.name, self.opts.extensions)) return;
+
+            var file = entry.parent_dir.openFile(cb_io, entry.name, .{ .mode = .read_only }) catch return;
+            defer file.close(cb_io);
+
+            const length = file.length(cb_io) catch return;
+            if (length == 0) return;
+
+            const FileSink = struct {
+                list: *match_list.MatchList,
+                display_path: []const u8,
+                count: usize = 0,
+
+                fn push(opaque_fs: *anyopaque, m: searcher.Match) anyerror!bool {
+                    const fs: *@This() = @ptrCast(@alignCast(opaque_fs));
+                    try fs.list.push(fs.display_path, m.line.line_no, m.cols, m.line.text);
+                    fs.count += 1;
+                    return true;
+                }
+            };
+
+            // Build display path on the stack (max path bytes).
+            var path_buf: [std.Io.Dir.max_path_bytes + 256]u8 = undefined;
+            const display_path: []const u8 = if (self.display_root.len == 0 or std.mem.eql(u8, self.display_root, "."))
+                entry.path
+            else blk: {
+                const total = self.display_root.len + 1 + entry.path.len;
+                if (total > path_buf.len) return; // pathologically long path — skip
+                @memcpy(path_buf[0..self.display_root.len], self.display_root);
+                path_buf[self.display_root.len] = '/';
+                @memcpy(path_buf[self.display_root.len + 1 ..][0..entry.path.len], entry.path);
+                break :blk path_buf[0..total];
+            };
+
+            var fs: FileSink = .{ .list = self.list, .display_path = display_path };
+
+            _ = searcher.searchFile(self.allocator, cb_io, file, length, .{
+                .needle = self.opts.needle,
+                .case_insensitive = self.opts.case_insensitive,
+                // No context for TUI mode — we render one line per match.
+                .before_context = 0,
+                .after_context = 0,
+            }, .{ .ctx = &fs, .onMatchFn = FileSink.push }) catch return;
+
+            _ = self.match_total.fetchAdd(fs.count, .monotonic);
+        }
+    };
+
+    var ctx: Ctx = .{
+        .allocator = allocator,
+        .opts = &options,
+        .list = list,
         .display_root = display_root,
     };
 

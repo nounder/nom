@@ -277,7 +277,6 @@ pub fn searchBytes(
                 ring_head = (ring_head + 1) % ring_cap;
             }
         }
-
     }
 
     // Flush any final pending match (with whatever after-context we got).
