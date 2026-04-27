@@ -23,6 +23,7 @@ const ParsedNth = @import("streaming_reader.zig").ParsedNth;
 const TopKHeap = @import("topk.zig").TopKHeap;
 const PreviewRunner = @import("preview.zig").PreviewRunner;
 const ansi = @import("ansi.zig");
+const icons_mod = @import("icons.zig");
 
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
@@ -90,6 +91,8 @@ pub const TuiConfig = struct {
     height: ?u16 = null, // Height in lines (null = use terminal height)
     scheme: @import("fzf.zig").Args.Scheme = .default,
     expect_tab: bool = false,
+    icon: icons_mod.When = .auto,
+    icon_theme: icons_mod.Theme = .fancy,
 };
 
 /// Preview window configuration
@@ -1510,12 +1513,35 @@ pub const Tui = struct {
 
         try self.term.write(" ");
 
-        // Text with highlighting (reserve 3 chars for pointer + space)
-        const text_width = max_width -| 3;
+        // Optional icon. Fancy (Nerd Font) glyphs are 1 column; unicode emoji
+        // are typically rendered 2 columns wide. Either way, we add a single
+        // trailing space. `.auto` shows icons (TUI is always interactive).
+        var icon_cols: u16 = 0;
+        const show_icon = switch (self.config.icon) {
+            .always, .auto => true,
+            .never => false,
+        };
+        if (show_icon) {
+            const icon = icons_mod.forPath(item.display, self.config.icon_theme);
+            const glyph_cols: u16 = switch (self.config.icon_theme) {
+                .fancy => 1,
+                .unicode => 2,
+            };
+            try self.term.resetStyle();
+            try self.term.setFg256(icon.color);
+            try self.term.write(icon.glyph);
+            try self.term.resetStyle();
+            try self.term.write(" ");
+            icon_cols = glyph_cols + 1;
+        }
+
+        // Text with highlighting (reserve pointer + space [+ icon + space])
+        const reserved: u16 = 3 + icon_cols;
+        const text_width = max_width -| reserved;
         const chars_written = try self.drawHighlightedText(item.display, item.indices, text_width, is_current);
 
         // Clear rest of line with spaces (don't use clearLineToEnd with preview)
-        const total_used: u16 = 2 + chars_written; // pointer + space + text
+        const total_used: u16 = 2 + icon_cols + chars_written; // pointer + space [+ icon + space] + text
         if (total_used < max_width) {
             var spaces: [256]u8 = undefined;
             const space_count = @min(max_width - total_used, 256);

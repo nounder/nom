@@ -16,6 +16,7 @@ const pattern_mod = @import("pattern.zig");
 const matcher_mod = @import("matcher.zig");
 const utf32_str = @import("utf32_str.zig");
 const ansi_mod = @import("ansi.zig");
+const icons_mod = @import("icons.zig");
 
 const Tui = tui_mod.Tui;
 const TuiConfig = tui_mod.TuiConfig;
@@ -56,6 +57,8 @@ pub const Args = struct {
     ansi: bool = false,
     tabstop: usize = 8,
     no_bold: bool = false,
+    icon: icons_mod.When = .auto,
+    icon_theme: icons_mod.Theme = .fancy,
 
     // History
     history: ?[]const u8 = null,
@@ -118,6 +121,8 @@ pub const Args = struct {
         .no_mouse = .{ .long = "--no-mouse" },
         .reverse = .{ .long = "--reverse", .neg_long = "--no-reverse" },
         .ansi = .{ .long = "--ansi", .neg_long = "--no-ansi" },
+        .icon = .{ .long = "--icon", .takes_value = true },
+        .icon_theme = .{ .long = "--icon-theme", .takes_value = true },
         .read0 = .{ .short = "-0", .long = "--read0" },
         .print0 = .{ .long = "--print0" },
         .select_1 = .{ .short = "-1", .long = "--select-1" },
@@ -319,6 +324,20 @@ pub const Args = struct {
             } else {
                 args.scheme = .default;
             }
+        } else if (FieldType == icons_mod.Theme) {
+            if (std.mem.eql(u8, value, "unicode")) {
+                args.icon_theme = .unicode;
+            } else {
+                args.icon_theme = .fancy;
+            }
+        } else if (FieldType == icons_mod.When) {
+            if (std.mem.eql(u8, value, "always")) {
+                args.icon = .always;
+            } else if (std.mem.eql(u8, value, "never")) {
+                args.icon = .never;
+            } else {
+                args.icon = .auto;
+            }
         }
     }
 };
@@ -480,6 +499,8 @@ pub fn printHelp(io: std.Io) void {
         \\  --ansi                Enable processing of ANSI color codes
         \\  --no-ansi             Disable ANSI color processing
         \\  --tabstop=N           Number of spaces for a tab character (default: 8)
+        \\  --icon=WHEN           When to show file-type icons: always, auto (default), never
+        \\  --icon-theme=THEME    Icon theme: fancy (Nerd Font, default), unicode
         \\
         \\Preview:
         \\  --preview=COMMAND     Command to preview highlighted line ({})
@@ -750,6 +771,8 @@ pub fn runTui(
         .preview_window = preview_window,
         .scheme = args.scheme,
         .expect_tab = hasExpectedKey(args.expect, "tab"),
+        .icon = args.icon,
+        .icon_theme = args.icon_theme,
     };
 
     // Run TUI
@@ -829,6 +852,8 @@ pub fn runTuiStreaming(
         .preview_window = preview_window,
         .scheme = args.scheme,
         .expect_tab = hasExpectedKey(args.expect, "tab"),
+        .icon = args.icon,
+        .icon_theme = args.icon_theme,
     };
 
     var tui = try Tui.init(allocator, io, &.{}, tui_config, ChunkSource{ .reader = reader });
@@ -905,6 +930,8 @@ pub fn runTuiWithWalker(
         .preview_window = preview_window,
         .scheme = args.scheme,
         .expect_tab = hasExpectedKey(args.expect, "tab"),
+        .icon = args.icon,
+        .icon_theme = args.icon_theme,
     };
 
     var tui = try Tui.init(allocator, io, &.{}, tui_config, ChunkSource{ .walker = walker });
